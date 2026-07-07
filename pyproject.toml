@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cocoaskills-registry"
+version = "0.1.0"
+description = "Audit registry service for CocoaSkills skill supply chain (RFC 0008)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Ivan Oparin" }]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "cryptography>=44",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9",
+  "httpx>=0.28",
+  "mypy>=1.14",
+]
+
+[project.scripts]
+csk-registry = "csk_registry.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/csk_registry"]
