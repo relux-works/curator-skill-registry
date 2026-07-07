@@ -78,13 +78,25 @@ def create_app(
             raise HTTPException(status_code=400, detail="record must carry a signature")
         if not verify(auditor.public_pinned, canonical_bytes(record), sig["signature"]):
             raise HTTPException(status_code=400, detail="record signature does not verify for this auditor")
+        # The registry countersigns what it serves so clients verify against the
+        # registry key alone; the auditor signature is kept as an endorsement
+        # for provenance.
+        countersigned = _countersign(record, signing_key, endorser=auditor.auditor_id)
         try:
-            entry = store.append(record, created_at=utc_now())
+            entry = store.append(countersigned, created_at=utc_now())
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"seq": entry.seq, "entry_hash": entry.entry_hash}
 
     return app
+
+
+def _countersign(record: dict[str, Any], signing_key: SigningKey, *, endorser: str) -> dict[str, Any]:
+    endorsement = {"endorser": endorser, "sig": record.get("sig")}
+    body = {key: value for key, value in record.items() if key != "sig"}
+    existing = body.get("endorsements")
+    body["endorsements"] = ([*existing, endorsement] if isinstance(existing, list) else [endorsement])
+    return signing_key.sign_record(body)
 
 
 def app_from_env() -> FastAPI:

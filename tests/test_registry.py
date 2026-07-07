@@ -157,3 +157,55 @@ def test_log_endpoint_returns_chain(tmp_path: Path):
     entries = client.get("/v1/log").json()["entries"]
     assert len(entries) == 3
     assert entries[0]["prev_hash"] == "0" * 64
+
+
+def test_post_countersigns_with_registry_key(tmp_path: Path):
+    client, registry_key, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    record = auditor_key.sign_record(_body("audited"))
+    resp = client.post("/v1/records", json=record, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    served = client.get("/v1/records", params={"content_sha256": "sha256:1f2e3d"}).json()["records"][0]
+    # The served record verifies against the registry key, not the auditor key.
+    assert signing.verify(registry_key.public_pinned, signing.canonical_bytes(served), served["sig"]["signature"])
+    assert not signing.verify(auditor_key.public_pinned, signing.canonical_bytes(served), served["sig"]["signature"])
+    # The auditor signature is retained as an endorsement.
+    assert served["endorsements"][0]["endorser"] == "a1"
+
+
+def test_export_and_import_bundle_roundtrip(tmp_path: Path):
+    from csk_registry.bundle import export_bundle, import_bundle
+
+    upstream = Store(tmp_path / "up.db")
+    up_key = signing.generate_key()
+    up_key.sign_record(_body("audited"))
+    upstream.append(up_key.sign_record(_body("audited")), created_at="2026-07-07T00:00:00Z")
+    upstream.append(up_key.sign_record(_body("revoked", commit="1" * 40)), created_at="2026-07-07T01:00:00Z")
+    bundle = export_bundle(upstream, up_key)
+    assert len(bundle["records"]) == 2
+
+    downstream = Store(tmp_path / "down.db")
+    down_key = signing.generate_key()
+    count = import_bundle(downstream, down_key, bundle, upstream_public_key=up_key.public_pinned)
+    assert count == 2
+    # Imported records are countersigned by the downstream key.
+    served = downstream.records_for(content_sha256="sha256:1f2e3d")[0]
+    assert signing.verify(down_key.public_pinned, signing.canonical_bytes(served), served["sig"]["signature"])
+    assert served["endorsements"][0]["endorser"] == "upstream-import"
+
+
+def test_import_bundle_rejects_wrong_upstream_key(tmp_path: Path):
+    from csk_registry.bundle import export_bundle, import_bundle
+
+    upstream = Store(tmp_path / "up.db")
+    up_key = signing.generate_key()
+    upstream.append(up_key.sign_record(_body("audited")), created_at="2026-07-07T00:00:00Z")
+    bundle = export_bundle(upstream, up_key)
+
+    downstream = Store(tmp_path / "down.db")
+    down_key = signing.generate_key()
+    wrong_key = signing.generate_key()
+    import pytest
+
+    with pytest.raises(ValueError, match="does not verify"):
+        import_bundle(downstream, down_key, bundle, upstream_public_key=wrong_key.public_pinned)

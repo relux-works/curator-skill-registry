@@ -11,6 +11,7 @@ from .clock import utc_now
 from .signing import export_key_pem, generate_key, load_key
 from .snapshot import build_snapshot
 from .store import Store
+from .bundle import export_bundle, import_bundle
 
 
 def _home(args: argparse.Namespace) -> Path:
@@ -69,6 +70,34 @@ def _cmd_export_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_export_bundle(args: argparse.Namespace) -> int:
+    home = _home(args)
+    key = load_key((home / "signing-key.pem").read_bytes())
+    store = Store(home / "registry.db")
+    bundle = export_bundle(store, key)
+    text = json.dumps(bundle, indent=2)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        print(json.dumps({"records": len(bundle["records"]), "path": args.out}, indent=2))
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_import_bundle(args: argparse.Namespace) -> int:
+    home = _home(args)
+    key = load_key((home / "signing-key.pem").read_bytes())
+    store = Store(home / "registry.db")
+    bundle = json.loads(Path(args.bundle).read_text(encoding="utf-8"))
+    try:
+        count = import_bundle(store, key, bundle, upstream_public_key=args.upstream_key)
+    except ValueError as exc:
+        print(f"import failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"imported": count}, indent=2))
+    return 0
+
+
 def _cmd_verify_chain(args: argparse.Namespace) -> int:
     home = _home(args)
     store = Store(home / "registry.db")
@@ -110,6 +139,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     snap = sub.add_parser("export-snapshot", help="print a signed snapshot")
     snap.set_defaults(func=_cmd_export_snapshot)
+
+    export_b = sub.add_parser("export-bundle", help="export a signed bundle of all records")
+    export_b.add_argument("--out", help="write the bundle to a file (default: stdout)")
+    export_b.set_defaults(func=_cmd_export_bundle)
+
+    import_b = sub.add_parser("import-bundle", help="import and countersign an upstream bundle")
+    import_b.add_argument("bundle", help="path to the exported bundle JSON")
+    import_b.add_argument("--upstream-key", required=True, help="upstream registry public key (ed25519:base64)")
+    import_b.set_defaults(func=_cmd_import_bundle)
 
     verify_chain = sub.add_parser("verify-chain", help="verify the transparency log hash chain")
     verify_chain.set_defaults(func=_cmd_verify_chain)

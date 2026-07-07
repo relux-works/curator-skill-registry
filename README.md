@@ -60,6 +60,8 @@ csk-registry --home ./data genkey            # generate the signing key
 csk-registry --home ./data issue-token <id>  # issue an auditor token
 csk-registry --home ./data sign-record       # sign a record body from stdin
 csk-registry --home ./data export-snapshot   # print a signed snapshot
+csk-registry --home ./data export-bundle     # export a signed bundle of all records
+csk-registry --home ./data import-bundle <f> --upstream-key <k>  # import an upstream bundle
 csk-registry --home ./data verify-chain      # verify the log hash chain
 ```
 
