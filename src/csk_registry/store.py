@@ -31,6 +31,16 @@ CREATE TABLE IF NOT EXISTS log (
 );
 CREATE INDEX IF NOT EXISTS idx_log_identity ON log (source_identity, commit_hash);
 CREATE INDEX IF NOT EXISTS idx_log_content ON log (content_sha256);
+CREATE TABLE IF NOT EXISTS idempotency (
+    key TEXT PRIMARY KEY,
+    body_sha256 TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS imported_records (
+    fingerprint TEXT PRIMARY KEY,
+    imported_at TEXT NOT NULL
+);
 """
 
 _GENESIS = "0" * 64
@@ -42,6 +52,10 @@ class LogEntry:
     entry_hash: str
     prev_hash: str
     record: dict[str, Any]
+
+
+class IdempotencyConflict(ValueError):
+    pass
 
 
 class Store:
@@ -61,36 +75,87 @@ class Store:
         self._conn.close()
 
     def append(self, record: dict[str, Any], *, created_at: str) -> LogEntry:
+        with self._lock, self._conn:
+            return self._append_locked(record, created_at=created_at)
+
+    def _append_locked(self, record: dict[str, Any], *, created_at: str) -> LogEntry:
         for key in ("name", "source_identity", "commit", "content_sha256", "status"):
             if not isinstance(record.get(key), str) or not record[key]:
                 raise ValueError(f"record requires a non-empty string {key!r}")
         record_bytes = canonical_bytes(record)
-        with self._lock, self._conn:
-            row = self._conn.execute("SELECT entry_hash FROM log ORDER BY seq DESC LIMIT 1").fetchone()
-            prev_hash = row["entry_hash"] if row else _GENESIS
-            entry_hash = hashlib.sha256(prev_hash.encode("ascii") + record_bytes).hexdigest()
-            cursor = self._conn.execute(
-                "INSERT INTO log (entry_hash, prev_hash, name, source_identity, commit_hash, "
-                "content_sha256, status, record_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entry_hash,
-                    prev_hash,
-                    record["name"],
-                    record["source_identity"],
-                    record["commit"],
-                    record["content_sha256"],
-                    record["status"],
-                    json.dumps(record, sort_keys=True),
-                    created_at,
-                ),
-            )
+        row = self._conn.execute("SELECT entry_hash FROM log ORDER BY seq DESC LIMIT 1").fetchone()
+        prev_hash = row["entry_hash"] if row else _GENESIS
+        entry_hash = hashlib.sha256(prev_hash.encode("ascii") + record_bytes).hexdigest()
+        cursor = self._conn.execute(
+            "INSERT INTO log (entry_hash, prev_hash, name, source_identity, commit_hash, "
+            "content_sha256, status, record_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entry_hash,
+                prev_hash,
+                record["name"],
+                record["source_identity"],
+                record["commit"],
+                record["content_sha256"],
+                record["status"],
+                json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+                created_at,
+            ),
+        )
         seq = int(cursor.lastrowid or 0)
         return LogEntry(seq=seq, entry_hash=entry_hash, prev_hash=prev_hash, record=record)
 
+    def append_idempotent(
+        self,
+        record: dict[str, Any],
+        *,
+        key: str,
+        body_sha256: str,
+        created_at: str,
+        now: int,
+        ttl_seconds: int,
+    ) -> tuple[dict[str, Any], bool]:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM idempotency WHERE expires_at <= ?", (now,))
+            existing = self._conn.execute(
+                "SELECT body_sha256, response_json FROM idempotency WHERE key = ?", (key,)
+            ).fetchone()
+            if existing is not None:
+                if existing["body_sha256"] != body_sha256:
+                    raise IdempotencyConflict("idempotency key was already used for a different body")
+                response = json.loads(existing["response_json"])
+                if not isinstance(response, dict):
+                    raise ValueError("stored idempotency response is invalid")
+                return response, True
+            entry = self._append_locked(record, created_at=created_at)
+            response = {"seq": entry.seq, "entry_hash": entry.entry_hash}
+            self._conn.execute(
+                "INSERT INTO idempotency (key, body_sha256, response_json, expires_at) VALUES (?, ?, ?, ?)",
+                (key, body_sha256, json.dumps(response, separators=(",", ":")), now + ttl_seconds),
+            )
+            return response, False
+
     def records_for(self, *, source_identity: str = "", commit: str = "", content_sha256: str = "") -> list[dict[str, Any]]:
         """Latest record per artifact matching identity+commit or content hash."""
+        records, _ = self.records_page(
+            source_identity=source_identity,
+            commit=commit,
+            content_sha256=content_sha256,
+            limit=10_000,
+            offset=0,
+        )
+        return records
+
+    def records_page(
+        self,
+        *,
+        source_identity: str = "",
+        commit: str = "",
+        content_sha256: str = "",
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
         clauses = []
-        params: list[str] = []
+        params: list[Any] = []
         if source_identity and commit:
             clauses.append("(source_identity = ? AND commit_hash = ?)")
             params.extend([source_identity, commit])
@@ -98,29 +163,57 @@ class Store:
             clauses.append("content_sha256 = ?")
             params.append(content_sha256)
         if not clauses:
-            return []
+            return [], False
         query = (
-            "SELECT record_json, MAX(seq) AS seq FROM log WHERE "
+            "SELECT record_json FROM (SELECT record_json, name, source_identity, commit_hash, seq, "
+            "ROW_NUMBER() OVER (PARTITION BY name, source_identity, commit_hash ORDER BY seq DESC) AS rank "
+            "FROM log WHERE "
             + " OR ".join(clauses)
-            + " GROUP BY name, source_identity, commit_hash"
+            + ") WHERE rank = 1 ORDER BY name, source_identity, commit_hash LIMIT ? OFFSET ?"
         )
-        rows = self._conn.execute(query, params).fetchall()
-        return [json.loads(row["record_json"]) for row in rows]
+        rows = self._conn.execute(query, [*params, limit + 1, offset]).fetchall()
+        records = [json.loads(row["record_json"]) for row in rows[:limit]]
+        return records, len(rows) > limit
 
     def log_entries(self, *, since: int = 0) -> list[LogEntry]:
+        entries, _ = self.log_page(since=since, limit=10_000, offset=0)
+        return entries
+
+    def log_page(self, *, since: int, limit: int, offset: int) -> tuple[list[LogEntry], bool]:
         rows = self._conn.execute(
-            "SELECT seq, entry_hash, prev_hash, record_json FROM log WHERE seq > ? ORDER BY seq ASC",
-            (since,),
+            "SELECT seq, entry_hash, prev_hash, record_json FROM log WHERE seq > ? "
+            "ORDER BY seq ASC LIMIT ? OFFSET ?",
+            (since, limit + 1, offset),
         ).fetchall()
-        return [
+        entries = [
             LogEntry(
                 seq=row["seq"],
                 entry_hash=row["entry_hash"],
                 prev_hash=row["prev_hash"],
                 record=json.loads(row["record_json"]),
             )
-            for row in rows
+            for row in rows[:limit]
         ]
+        return entries, len(rows) > limit
+
+    def append_imports(
+        self, records: list[tuple[str, dict[str, Any]]], *, created_at: str
+    ) -> int:
+        imported = 0
+        with self._lock, self._conn:
+            for fingerprint, record in records:
+                exists = self._conn.execute(
+                    "SELECT 1 FROM imported_records WHERE fingerprint = ?", (fingerprint,)
+                ).fetchone()
+                if exists is not None:
+                    continue
+                self._append_locked(record, created_at=created_at)
+                self._conn.execute(
+                    "INSERT INTO imported_records (fingerprint, imported_at) VALUES (?, ?)",
+                    (fingerprint, created_at),
+                )
+                imported += 1
+        return imported
 
     def head(self) -> tuple[int, str]:
         row = self._conn.execute("SELECT seq, entry_hash FROM log ORDER BY seq DESC LIMIT 1").fetchone()
