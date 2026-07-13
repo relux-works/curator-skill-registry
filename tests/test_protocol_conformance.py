@@ -9,7 +9,14 @@ import pytest
 
 from csk_registry import signing
 from csk_registry.bundle import import_bundle
-from csk_registry.protocol import ProtocolError, load_json, validate_record, validate_snapshot
+from csk_registry.protocol import (
+    ProtocolError,
+    load_json,
+    portable_path,
+    validate_record,
+    validate_snapshot,
+    validate_source_identity,
+)
 from csk_registry.store import Store
 
 
@@ -37,6 +44,29 @@ def test_ccj_positive_vectors(case: dict[str, Any]) -> None:
 def test_ccj_rejection_vectors(case: dict[str, str]) -> None:
     with pytest.raises(ProtocolError):
         load_json(case["input_text"])
+
+
+@pytest.mark.parametrize("case", _json("vectors/portable-paths.json") if ROOT_TEXT else [])
+def test_portable_path_vectors(case: dict[str, Any]) -> None:
+    assert portable_path(case["input"]) is case["valid"]
+
+
+@pytest.mark.parametrize("case", _json("vectors/source-identities.json") if ROOT_TEXT else [])
+def test_source_identity_output_vectors(case: dict[str, Any]) -> None:
+    identity = case.get("identity")
+    if identity is not None:
+        assert validate_source_identity(identity) == identity
+
+
+@pytest.mark.parametrize("case", _json("vectors/identifiers.json") if ROOT_TEXT else [])
+def test_identifier_vectors(case: dict[str, Any]) -> None:
+    record = dict(_json("expected/registry/record_audited.json"))
+    record["name"] = case["input"]
+    if case["valid"]:
+        assert validate_record(record)["name"] == case["input"]
+    else:
+        with pytest.raises(ProtocolError):
+            validate_record(record)
 
 
 def test_shared_signed_objects() -> None:
