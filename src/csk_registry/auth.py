@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .permissions import require_private_file
 from .protocol import load_json
 from .signing import parse_public_key
 
@@ -53,6 +54,7 @@ class AuditorTokens:
     def from_file(cls, path: Path) -> "AuditorTokens":
         if not path.exists():
             return cls([])
+        require_private_file(path)
         data = load_json(path.read_bytes())
         if not isinstance(data, dict) or set(data) != {"auditors"}:
             raise ValueError("auditors file must contain exactly one auditors array")

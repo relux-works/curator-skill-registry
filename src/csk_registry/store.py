@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from .permissions import protect_private_file
 from .signing import canonical_bytes
 
 
@@ -127,8 +129,9 @@ class StoreIntegrityError(RuntimeError):
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
-        database_existed = path.exists() and path.stat().st_size > 0
         path.parent.mkdir(parents=True, exist_ok=True)
+        database_existed = path.exists() and path.stat().st_size > 0
+        _prepare_private_database_file(path)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(path),
@@ -136,7 +139,6 @@ class Store:
             isolation_level=None,
             timeout=5.0,
         )
-        path.chmod(0o600)
         self._conn.row_factory = sqlite3.Row
         try:
             self._conn.execute("PRAGMA busy_timeout=5000")
@@ -164,10 +166,14 @@ class Store:
                     raise StoreIntegrityError(
                         f"unsupported database schema version {user_version}"
                     )
+            _protect_sqlite_sidecars(path)
             errors = self.integrity_errors()
         except sqlite3.DatabaseError as exc:
             self.close()
             raise StoreIntegrityError(f"SQLite integrity verification failed: {exc}") from exc
+        except (OSError, ValueError):
+            self.close()
+            raise
         except StoreIntegrityError:
             self.close()
             raise
@@ -831,6 +837,7 @@ class Store:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
             raise FileExistsError(destination)
+        _prepare_private_database_file(destination)
         with self._lock:
             target = sqlite3.connect(str(destination))
             try:
@@ -842,6 +849,23 @@ class Store:
             return backup.snapshot_boundary()
         finally:
             backup.close()
+
+
+def _prepare_private_database_file(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        os.close(descriptor)
+    protect_private_file(path)
+
+
+def _protect_sqlite_sidecars(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            protect_private_file(sidecar)
 
 
 def _entry_from_row(row: sqlite3.Row) -> LogEntry:

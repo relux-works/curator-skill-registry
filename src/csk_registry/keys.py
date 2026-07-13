@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import stat
 import tempfile
 from pathlib import Path
 
+from .permissions import (
+    protect_private_directory,
+    protect_private_file,
+    require_private_file,
+)
 from .signing import (
     SigningKey,
     export_key_pem,
@@ -101,7 +105,7 @@ def activate_rotation(home: Path) -> tuple[SigningKey, SigningKey]:
     staged = load_key(_read_private_key(staged_path))
     _write_public_keys(home, (*public_keys(home, active), staged.public_pinned))
     os.replace(staged_path, active_key_path(home))
-    active_key_path(home).chmod(0o600)
+    protect_private_file(active_key_path(home))
     _sync_directory(home)
     return active, staged
 
@@ -157,15 +161,20 @@ def write_private_json(path: Path, value: object) -> None:
 
 def _atomic_write(path: Path, payload: bytes, mode: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    protect_private_directory(path.parent)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
+        os.close(descriptor)
+        temporary.chmod(mode)
+        protect_private_file(temporary)
+        with temporary.open("wb") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.chmod(mode)
+        protect_private_file(temporary)
         os.replace(temporary, path)
+        protect_private_file(path)
         _sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
@@ -183,11 +192,7 @@ def _sync_directory(path: Path) -> None:
 
 def _read_private_key(path: Path) -> bytes:
     try:
-        metadata = path.lstat()
-    except OSError as exc:
+        require_private_file(path)
+    except (OSError, ValueError) as exc:
         raise ValueError(f"signing key {path} is unavailable: {exc}") from exc
-    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"signing key {path} is not a regular file")
-    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ValueError(f"signing key {path} permissions are too broad")
     return path.read_bytes()

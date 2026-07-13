@@ -8,8 +8,10 @@ The service treats HTTP bytes, auditor records, cursors, bundles, databases,
 and backup checkpoints as untrusted until their applicable validation and
 cryptographic checks pass. Auditor bearer tokens are stored only as SHA-256
 digests and compared in constant time. The data home, signing keys, keyring,
-auditor file, and database are created with owner-only permissions where the
-platform supports them.
+auditor file, database, and SQLite sidecars are created with owner-only access:
+`0700`/`0600` modes on POSIX and a protected, current-service-identity DACL on
+Windows. State creation and private-file loading fail closed when those access
+controls cannot be established or verified.
 
 A registry signing-key compromise can authorize false records. Stop writes,
 stage and distribute a new trust anchor through an independent channel,
@@ -26,4 +28,3 @@ trust; clients pin registry keys out of band.
 
 The complete normative threat model and deployment requirements are in the
 [Curator registry-service profile](https://github.com/relux-works/curator-spec/blob/main/profiles/registry-service.md).
-

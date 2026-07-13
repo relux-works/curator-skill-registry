@@ -4,8 +4,9 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import sqlite3
-import stat
+import subprocess
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,12 @@ from csk_registry.app import create_app
 from csk_registry.auth import Auditor, AuditorTokens
 from csk_registry.cli import build_parser, main
 from csk_registry.keys import load_active_key, public_keys
+from csk_registry.permissions import (
+    private_directory_permissions_enforced,
+    private_file_permissions_enforced,
+    protect_private_directory,
+    protect_private_file,
+)
 from csk_registry.protocol import ProtocolError, portable_path, validate_record, validate_source_identity
 from csk_registry.snapshot import build_snapshot
 from csk_registry.store import SnapshotBoundary, Store, StoreIntegrityError
@@ -64,8 +71,39 @@ def test_auditor_credentials_are_replaced_atomically_with_private_permissions(tm
         ]
     ) == 0
     auditors = home / "auditors.json"
-    assert stat.S_IMODE(auditors.stat().st_mode) == 0o600
+    assert private_directory_permissions_enforced(home)
+    assert private_file_permissions_enforced(auditors)
     assert not list(home.glob(".auditors.json-*"))
+
+
+def test_private_registry_state_uses_platform_access_controls(tmp_path: Path):
+    home = tmp_path / "home"
+    assert main(["--home", str(home), "genkey"]) == 0
+    store = Store(home / "registry.db")
+    store.close()
+
+    assert private_directory_permissions_enforced(home)
+    assert private_file_permissions_enforced(home / "signing-key.pem")
+    assert private_file_permissions_enforced(home / "signing-keyring.json")
+    assert private_file_permissions_enforced(home / "registry.db")
+
+
+def test_private_key_load_fails_closed_for_broad_access(tmp_path: Path):
+    home = tmp_path / "home"
+    assert main(["--home", str(home), "genkey"]) == 0
+    key_path = home / "signing-key.pem"
+    if os.name == "nt":
+        subprocess.run(
+            ["icacls", str(key_path), "/grant", "*S-1-1-0:(R)"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        key_path.chmod(0o644)
+
+    with pytest.raises(ValueError, match="unavailable"):
+        load_active_key(home)
 
 
 def _body(status: str = "audited", **overrides: object) -> dict[str, object]:
@@ -570,10 +608,11 @@ def test_backup_and_external_checkpoint_preserve_boundary(tmp_path: Path):
 def test_backup_cli_emits_and_verifies_signed_checkpoint(tmp_path: Path):
     home = tmp_path / "home"
     home.mkdir()
+    protect_private_directory(home)
     key = signing.generate_key()
     key_path = home / "signing-key.pem"
     key_path.write_bytes(signing.export_key_pem(key))
-    key_path.chmod(0o600)
+    protect_private_file(key_path)
     store = Store(home / "registry.db")
     store.append(key.sign_record(_body()), created_at="2026-07-07T00:00:00Z")
     store.close()

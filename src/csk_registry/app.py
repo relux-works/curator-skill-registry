@@ -22,6 +22,7 @@ from .auth import AuditorTokens
 from .clock import utc_now
 from .keys import load_active_key, public_keys
 from .limits import FixedWindowLimiter
+from .permissions import protect_private_directory
 from .protocol import ProtocolError, load_json, validate_record, validate_source_identity
 from .signing import (
     SigningKey,
@@ -554,7 +555,7 @@ def _success_response(payload: dict[str, Any], *, status_code: int) -> JSONRespo
 def app_from_env() -> FastAPI:
     home = Path(home_from_env()).expanduser()
     home.mkdir(parents=True, exist_ok=True)
-    home.chmod(0o700)
+    protect_private_directory(home)
     key_path = home / "signing-key.pem"
     if not key_path.exists():
         raise RuntimeError(f"signing key not found at {key_path}; run '{COMMAND_NAME} genkey' first")

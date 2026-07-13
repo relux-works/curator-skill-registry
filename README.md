@@ -150,9 +150,15 @@ window. Startup refuses unexpired unscoped entries because assigning them to an
 auditor would be ambiguous. Expired entries are discarded while the schema is
 migrated; log history is unchanged.
 
-Signing-key files must remain regular service-owned files with private
-permissions (`0600` on POSIX). Startup refuses symlinked or broadly readable
-private keys.
+Private state is fail-closed. On POSIX, the data home is `0700` and private
+files are `0600`. On Windows, the service replaces inherited permissions with
+a protected DACL that grants full access only to the current service identity;
+child state inherits that identity-only policy. Signing keys and auditor files
+are rejected if their type or access controls are unsafe, and every write is
+verified after replacement. The database and its SQLite sidecars are likewise
+created private. Use local durable storage whose filesystem supports native
+POSIX modes or Windows ACLs; do not place the data home on a filesystem that
+cannot preserve and enforce them.
 
 ## Development
 

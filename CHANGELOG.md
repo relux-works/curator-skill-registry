@@ -38,3 +38,5 @@
   readiness instead of truncating or repairing authoritative history.
 - Private signing keys are loaded only from regular, service-private files;
   credential documents are strictly validated and atomically replaced.
+- Private state now uses verified `0700`/`0600` modes on POSIX and protected
+  current-service-identity DACLs on Windows; unsafe credentials fail closed.

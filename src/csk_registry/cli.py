@@ -24,6 +24,7 @@ from .keys import (
     retire_public_key,
     write_private_json,
 )
+from .permissions import protect_private_directory
 from .protocol import load_json, validate_record, validate_snapshot
 from .signing import verify_signed
 from .snapshot import build_snapshot
@@ -33,7 +34,7 @@ from .store import SnapshotBoundary, Store, StoreIntegrityError
 def _home(args: argparse.Namespace) -> Path:
     home = Path(args.home).expanduser()
     home.mkdir(parents=True, exist_ok=True)
-    home.chmod(0o700)
+    protect_private_directory(home)
     return home
 
 
