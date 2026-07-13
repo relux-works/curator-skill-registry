@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from .clock import utc_now
-from .signing import SigningKey, canonical_bytes, verify
+from .protocol import validate_record, validate_snapshot
+from .signing import SigningKey, canonical_bytes, parse_public_key, verify_signed
 from .snapshot import build_snapshot
 from .store import Store
 
@@ -41,34 +44,66 @@ def import_bundle(
     the local key so local clients verify against the local registry.
     Returns the number of records imported.
     """
-    snapshot = bundle.get("snapshot")
-    if not isinstance(snapshot, dict):
-        raise ValueError("bundle is missing a snapshot")
-    if not verify(upstream_public_key, canonical_bytes(snapshot), _sig(snapshot)):
+    if not isinstance(bundle, dict) or set(bundle) - {"schema_version", "records", "snapshot", "public_key"}:
+        raise ValueError("bundle contains unsupported fields")
+    if bundle.get("schema_version") != 1:
+        raise ValueError("bundle schema_version must be 1")
+    snapshot = validate_snapshot(bundle.get("snapshot"))
+    if not verify_signed(upstream_public_key, snapshot):
         raise ValueError("bundle snapshot does not verify against the upstream key")
+    embedded_key = bundle.get("public_key")
+    if embedded_key is not None:
+        if not isinstance(embedded_key, str) or parse_public_key(embedded_key) != parse_public_key(upstream_public_key):
+            raise ValueError("bundle public_key does not match the pinned upstream key")
     records = bundle.get("records")
     if not isinstance(records, list):
         raise ValueError("bundle is missing records")
-    imported = 0
+    verified: list[dict[str, Any]] = []
+    entry_hashes: list[bytes] = []
+    previous = "0" * 64
     for record in records:
-        if not isinstance(record, dict):
-            raise ValueError("bundle record must be an object")
-        if not verify(upstream_public_key, canonical_bytes(record), _sig(record)):
+        checked = validate_record(record)
+        if not verify_signed(upstream_public_key, checked):
             raise ValueError(f"bundle record for {record.get('name')!r} does not verify against the upstream key")
+        entry_hash = hashlib.sha256(previous.encode("ascii") + canonical_bytes(checked)).hexdigest()
+        previous = entry_hash
+        entry_hashes.append(bytes.fromhex(entry_hash))
+        verified.append(checked)
+    if snapshot["log_size"] != len(verified) or snapshot["head"] != previous:
+        raise ValueError("bundle records do not match the snapshot log head or size")
+    if snapshot["merkle_root"] != _merkle_root(entry_hashes):
+        raise ValueError("bundle records do not match the snapshot Merkle root")
+
+    imports: list[tuple[str, dict[str, Any]]] = []
+    for record in verified:
         endorsement = {"endorser": "upstream-import", "sig": record.get("sig")}
         body = {key: value for key, value in record.items() if key != "sig"}
         existing = body.get("endorsements")
         body["endorsements"] = ([*existing, endorsement] if isinstance(existing, list) else [endorsement])
-        store.append(signing_key.sign_record(body), created_at=utc_now())
-        imported += 1
-    return imported
+        signature = record["sig"]["signature"]
+        fingerprint_body = [
+            record["source_identity"],
+            record["commit"],
+            record["content_sha256"],
+            record["status"],
+            signature,
+        ]
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        imports.append((fingerprint, signing_key.sign_record(body)))
+    return store.append_imports(imports, created_at=utc_now())
 
 
-def _sig(obj: dict[str, Any]) -> str:
-    sig = obj.get("sig")
-    if not isinstance(sig, dict):
-        raise ValueError("object is not signed")
-    signature = sig.get("signature")
-    if not isinstance(signature, str):
-        raise ValueError("object is not signed")
-    return signature
+def _merkle_root(leaves: list[bytes]) -> str:
+    if not leaves:
+        return "0" * 64
+    level = leaves
+    while len(level) > 1:
+        next_level: list[bytes] = []
+        for index in range(0, len(level), 2):
+            left = level[index]
+            right = level[index + 1] if index + 1 < len(level) else left
+            next_level.append(hashlib.sha256(left + right).digest())
+        level = next_level
+    return level[0].hex()

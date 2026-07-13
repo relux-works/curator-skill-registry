@@ -1,15 +1,15 @@
-# CocoaSkills Audit Registry
+# Curator Audit Registry
 
-An audit registry service for the [CocoaSkills](https://cocoaskills.org) skill
-supply chain. It serves signed statements that a skill, at a specific commit and
-content hash, was audited or revoked, and it maintains an append-only
-transparency log with a signed snapshot. The protocol is
-[RFC 0008](https://cocoaskills.org/v0.11-design.md).
+An implementation of the open
+[Curator Audit Registry Protocol](https://github.com/relux-works/curator-spec/blob/main/protocol/registry.md).
+It serves signed statements that a skill at a specific commit and content hash
+was audited or revoked, and maintains an append-only transparency log with a
+signed snapshot.
 
-This repository is the reference implementation. Anyone can deploy it: the
-public central registry runs it, and an organization runs its own instance for
-a closed network. A CocoaSkills client pins the registries it trusts and
-verifies every record against pinned Ed25519 keys before trusting it.
+Anyone can deploy it on a public or closed network. A conforming Curator client
+pins the registries it trusts and verifies every record against out-of-band
+Ed25519 keys before trusting it. The distribution and executable retain their
+existing `cocoaskills-registry` and `csk-registry` compatibility names.
 
 ## Model
 
@@ -22,6 +22,10 @@ verifies every record against pinned Ed25519 keys before trusting it.
   client detects a rolled-back or withheld view.
 - Submission requires an auditor token bound to a registered key, and the record
   must verify against that key.
+- Signed pagination cursors are query-bound; repeated submissions are
+  transactionally idempotent for at least 24 hours.
+- Offline bundles are accepted only after signatures, log chain, head, size,
+  and Merkle root all match the pinned upstream snapshot.
 
 ## Run
 
@@ -48,10 +52,15 @@ docker compose exec registry csk-registry --home /data genkey
 
 - `GET /health`
 - `GET /v1/meta` registry name, public keys, schema versions, policy
-- `GET /v1/records?source_identity=&commit=` or `?content_sha256=`
+- `GET /v1/records?source_identity=&commit=` or `?content_sha256=` with
+  `limit`, `cursor`, and `next_cursor`
 - `GET /v1/snapshot` signed Merkle root, size, version, timestamp
-- `GET /v1/log?since=` transparency log entries
-- `POST /v1/records` submit a signed record (auditor token required)
+- `GET /v1/log?since=` paginated transparency log entries
+- `POST /v1/records` submit a signed record (auditor token required;
+  `Idempotency-Key` supported)
+
+Every error uses the stable Curator error envelope. Production instances use
+HTTPS; plain HTTP is reserved for explicitly configured loopback deployments.
 
 ## Admin CLI
 
@@ -75,10 +84,9 @@ pytest
 mypy
 ```
 
-The signing canonicalization must stay byte-identical to the CocoaSkills client
-(`csk.audit_registry.canonical_bytes`): compact sorted JSON of every field
-except `sig`. A cross-project test confirms the client verifies signatures this
-service produces.
+CI checks out the authoritative specification suite and verifies CCJ-1 bytes,
+signed objects, chain/Merkle commitments, and authenticated bundle imports on
+Linux, macOS, and Windows.
 
 ## License
 

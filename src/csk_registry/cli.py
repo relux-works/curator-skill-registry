@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .clock import utc_now
+from .protocol import load_json, validate_record
 from .signing import export_key_pem, generate_key, load_key
 from .snapshot import build_snapshot
 from .store import Store
@@ -56,8 +57,13 @@ def _cmd_issue_token(args: argparse.Namespace) -> int:
 def _cmd_sign_record(args: argparse.Namespace) -> int:
     home = _home(args)
     key = load_key((home / "signing-key.pem").read_bytes())
-    body = json.loads(Path(args.record).read_text(encoding="utf-8") if args.record else sys.stdin.read())
-    print(json.dumps(key.sign_record(body), indent=2))
+    body = load_json(Path(args.record).read_bytes() if args.record else sys.stdin.buffer.read())
+    if not isinstance(body, dict):
+        raise ValueError("record body must be a JSON object")
+    body.setdefault("schema_version", 1)
+    record = key.sign_record(body)
+    validate_record(record)
+    print(json.dumps(record, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -88,7 +94,10 @@ def _cmd_import_bundle(args: argparse.Namespace) -> int:
     home = _home(args)
     key = load_key((home / "signing-key.pem").read_bytes())
     store = Store(home / "registry.db")
-    bundle = json.loads(Path(args.bundle).read_text(encoding="utf-8"))
+    bundle = load_json(Path(args.bundle).read_bytes())
+    if not isinstance(bundle, dict):
+        print("import failed: bundle must be a JSON object", file=sys.stderr)
+        return 1
     try:
         count = import_bundle(store, key, bundle, upstream_public_key=args.upstream_key)
     except ValueError as exc:

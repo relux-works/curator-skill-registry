@@ -21,7 +21,7 @@ def _body(status: str = "audited", **overrides: object) -> dict[str, object]:
         "name": "skill-tracker",
         "source_identity": "gitlab.example.com/skills/skill-tracker",
         "commit": "8c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
-        "content_sha256": "sha256:1f2e3d",
+        "content_sha256": "sha256:" + "1f" * 32,
         "status": status,
         "audit": {"ruleset_version": "csk-audit/1"},
     }
@@ -53,7 +53,7 @@ def test_store_append_and_lookup(tmp_path: Path):
     )
     assert len(found) == 1
     assert found[0]["status"] == "audited"
-    by_hash = store.records_for(content_sha256="sha256:1f2e3d")
+    by_hash = store.records_for(content_sha256="sha256:" + "1f" * 32)
     assert len(by_hash) == 1
 
 
@@ -62,7 +62,7 @@ def test_revocation_supersedes_audit(tmp_path: Path):
     key = signing.generate_key()
     store.append(key.sign_record(_body("audited")), created_at="2026-07-07T00:00:00Z")
     store.append(key.sign_record(_body("revoked")), created_at="2026-07-07T01:00:00Z")
-    found = store.records_for(content_sha256="sha256:1f2e3d")
+    found = store.records_for(content_sha256="sha256:" + "1f" * 32)
     assert len(found) == 1
     assert found[0]["status"] == "revoked"
 
@@ -94,7 +94,7 @@ def _client(tmp_path: Path) -> tuple[TestClient, signing.SigningKey, str]:
     store = Store(tmp_path / "r.db")
     key = signing.generate_key()
     auditor_key = signing.generate_key()
-    token = "secret-token"
+    token = "test-token-with-at-least-128-bit-capacity"
     tokens = AuditorTokens(
         [
             Auditor(
@@ -127,14 +127,15 @@ def test_submit_requires_valid_token_and_signature(tmp_path: Path):
     assert client.post("/v1/records", json=record).status_code == 401
     # Valid token and signature.
     resp = client.post("/v1/records", json=record, headers={"Authorization": f"Bearer {token}"})
-    assert resp.status_code == 200
+    assert resp.status_code == 201
     assert resp.json()["seq"] == 1
     # Now retrievable.
     got = client.get(
         "/v1/records",
-        params={"content_sha256": "sha256:1f2e3d"},
+        params={"content_sha256": "sha256:" + "1f" * 32},
     ).json()
     assert got["records"][0]["status"] == "audited"
+    assert got["next_cursor"] is None
 
 
 def test_submit_rejects_wrong_signature(tmp_path: Path):
@@ -164,8 +165,8 @@ def test_post_countersigns_with_registry_key(tmp_path: Path):
     auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
     record = auditor_key.sign_record(_body("audited"))
     resp = client.post("/v1/records", json=record, headers={"Authorization": f"Bearer {token}"})
-    assert resp.status_code == 200
-    served = client.get("/v1/records", params={"content_sha256": "sha256:1f2e3d"}).json()["records"][0]
+    assert resp.status_code == 201
+    served = client.get("/v1/records", params={"content_sha256": "sha256:" + "1f" * 32}).json()["records"][0]
     # The served record verifies against the registry key, not the auditor key.
     assert signing.verify(registry_key.public_pinned, signing.canonical_bytes(served), served["sig"]["signature"])
     assert not signing.verify(auditor_key.public_pinned, signing.canonical_bytes(served), served["sig"]["signature"])
@@ -189,7 +190,7 @@ def test_export_and_import_bundle_roundtrip(tmp_path: Path):
     count = import_bundle(downstream, down_key, bundle, upstream_public_key=up_key.public_pinned)
     assert count == 2
     # Imported records are countersigned by the downstream key.
-    served = downstream.records_for(content_sha256="sha256:1f2e3d")[0]
+    served = downstream.records_for(content_sha256="sha256:" + "1f" * 32)[0]
     assert signing.verify(down_key.public_pinned, signing.canonical_bytes(served), served["sig"]["signature"])
     assert served["endorsements"][0]["endorser"] == "upstream-import"
 
@@ -209,3 +210,59 @@ def test_import_bundle_rejects_wrong_upstream_key(tmp_path: Path):
 
     with pytest.raises(ValueError, match="does not verify"):
         import_bundle(downstream, down_key, bundle, upstream_public_key=wrong_key.public_pinned)
+
+
+def test_records_pagination_cursor_is_query_bound(tmp_path: Path):
+    client, _, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(3):
+        record = auditor_key.sign_record(_body(name=f"skill-{index}"))
+        assert client.post(
+            "/v1/records", json=record, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 201
+    first = client.get("/v1/records", params={"content_sha256": content_hash, "limit": 1})
+    assert first.status_code == 200
+    first_body = first.json()
+    assert [record["name"] for record in first_body["records"]] == ["skill-0"]
+    cursor = first_body["next_cursor"]
+    second = client.get(
+        "/v1/records",
+        params={"content_sha256": content_hash, "limit": 1, "cursor": cursor},
+    )
+    assert [record["name"] for record in second.json()["records"]] == ["skill-1"]
+    rebound = client.get(
+        "/v1/records",
+        params={"content_sha256": "sha256:" + "2f" * 32, "limit": 1, "cursor": cursor},
+    )
+    assert rebound.status_code == 404
+    assert rebound.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_submission_idempotency_replays_and_conflicts(tmp_path: Path):
+    client, _, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    first_record = auditor_key.sign_record(_body("audited"))
+    headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": "request-1"}
+    first = client.post("/v1/records", json=first_record, headers=headers)
+    replay = client.post("/v1/records", json=first_record, headers=headers)
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    changed = auditor_key.sign_record(_body("revoked"))
+    conflict = client.post("/v1/records", json=changed, headers=headers)
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "idempotency_conflict"
+    assert len(client.get("/v1/log").json()["entries"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "expected_status"),
+    [("get", "/v1/records", 400), ("get", "/missing", 404), ("post", "/v1/records", 401)],
+)
+def test_errors_use_stable_protocol_envelope(tmp_path: Path, method: str, path: str, expected_status: int):
+    client, _, _ = _client(tmp_path)
+    response = client.post(path, json={}) if method == "post" else client.get(path)
+    assert response.status_code == expected_status
+    error = response.json()["error"]
+    assert set(error) >= {"code", "message"}

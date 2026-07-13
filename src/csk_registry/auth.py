@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .signing import parse_public_key
+
 
 # Auditor submission is gated by a token bound to a registered signing key. A
 # token is an opaque secret; the store keeps only its SHA-256, so the file at
@@ -22,6 +24,12 @@ class Auditor:
 
 class AuditorTokens:
     def __init__(self, auditors: list[Auditor]) -> None:
+        for auditor in auditors:
+            parse_public_key(auditor.public_pinned)
+            if len(auditor.token_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in auditor.token_sha256
+            ):
+                raise ValueError(f"auditor {auditor.auditor_id!r} has an invalid token digest")
         self._by_hash = {auditor.token_sha256: auditor for auditor in auditors}
 
     @classmethod
@@ -41,7 +49,7 @@ class AuditorTokens:
         return cls(auditors)
 
     def resolve(self, token: str) -> Auditor | None:
-        if not token:
+        if len(token) < 22:
             return None
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         for candidate_hash, auditor in self._by_hash.items():
