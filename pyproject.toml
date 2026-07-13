@@ -21,6 +21,8 @@ dev = [
   "pytest>=9",
   "httpx>=0.28",
   "mypy>=1.14",
+  "build>=1.2",
+  "twine>=5",
 ]
 
 [project.scripts]
@@ -29,7 +31,8 @@ csk-registry = "csk_registry.cli:main"
 
 [project.urls]
 Repository = "https://github.com/relux-works/curator-skill-registry"
-Specification = "https://github.com/relux-works/curator-spec/blob/main/protocol/registry.md"
+"Registry Protocol" = "https://github.com/relux-works/curator-spec/blob/main/protocol/registry.md"
+"Service Profile" = "https://github.com/relux-works/curator-spec/blob/main/profiles/registry-service.md"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -1,0 +1,29 @@
+# Security policy
+
+Report suspected vulnerabilities privately to `ivan@relux.works`. Include a
+minimal reproducer, affected command or endpoint, and impact. Do not attach
+production tokens, private signing keys, or private registry records.
+
+The service treats HTTP bytes, auditor records, cursors, bundles, databases,
+and backup checkpoints as untrusted until their applicable validation and
+cryptographic checks pass. Auditor bearer tokens are stored only as SHA-256
+digests and compared in constant time. The data home, signing keys, keyring,
+auditor file, and database are created with owner-only permissions where the
+platform supports them.
+
+A registry signing-key compromise can authorize false records. Stop writes,
+stage and distribute a new trust anchor through an independent channel,
+activate it, retire the compromised key with `retire-key --compromised`, and
+publish corrective records through an unaffected auditor. History is not
+rewritten. An auditor compromise disables that auditor credential and uses a
+different authorized auditor for corrective records.
+
+Restore is fail-closed: `verify-backup` validates the full store and requires a
+signed external high-water checkpoint before the database can serve the same
+canonical URL. Keep checkpoints and secret backups outside the primary store,
+encrypted and access controlled. Cursor and response data never bootstrap
+trust; clients pin registry keys out of band.
+
+The complete normative threat model and deployment requirements are in the
+[Curator registry-service profile](https://github.com/relux-works/curator-spec/blob/main/profiles/registry-service.md).
+

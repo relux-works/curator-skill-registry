@@ -21,7 +21,7 @@ from .store import Store
 def export_bundle(store: Store, signing_key: SigningKey) -> dict[str, Any]:
     entries = store.log_entries()
     records = [entry.record for entry in entries]
-    snapshot = build_snapshot(store, signing_key, created_at=utc_now(), version=store.head()[0])
+    snapshot = build_snapshot(store, signing_key)
     return {
         "schema_version": 1,
         "records": records,
