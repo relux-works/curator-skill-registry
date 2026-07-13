@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 import re
 import time
 from pathlib import Path
@@ -13,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__
+from . import COMMAND_NAME, __version__, home_from_env
 from .auth import AuditorTokens
 from .clock import utc_now
 from .protocol import ProtocolError, load_json, validate_record, validate_source_identity
@@ -48,9 +47,9 @@ def create_app(
     store: Store,
     signing_key: SigningKey,
     tokens: AuditorTokens,
-    registry_name: str = "curator-registry",
+    registry_name: str = "curator-skill-registry",
 ) -> FastAPI:
-    app = FastAPI(title="Curator Audit Registry", version=__version__)
+    app = FastAPI(title="Curator Skill Registry", version=__version__)
 
     def snapshot_version() -> int:
         size, _ = store.head()
@@ -274,11 +273,11 @@ def _error_response(status: int, code: str, message: str, details: dict[str, Any
 
 
 def app_from_env() -> FastAPI:
-    home = Path(os.environ.get("CSK_REGISTRY_HOME", "./data")).expanduser()
+    home = Path(home_from_env()).expanduser()
     home.mkdir(parents=True, exist_ok=True)
     key_path = home / "signing-key.pem"
     if not key_path.exists():
-        raise RuntimeError(f"signing key not found at {key_path}; run 'csk-registry genkey' first")
+        raise RuntimeError(f"signing key not found at {key_path}; run '{COMMAND_NAME} genkey' first")
     signing_key = load_key(key_path.read_bytes())
     store = Store(home / "registry.db")
     tokens = AuditorTokens.from_file(home / "auditors.json")

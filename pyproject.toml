@@ -3,7 +3,7 @@ requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cocoaskills-registry"
+name = "curator-skill-registry"
 version = "0.1.0"
 description = "Registry service for the open Curator Protocol skill supply chain"
 readme = "README.md"
@@ -24,7 +24,12 @@ dev = [
 ]
 
 [project.scripts]
+curator-skill-registry = "csk_registry.cli:main"
 csk-registry = "csk_registry.cli:main"
+
+[project.urls]
+Repository = "https://github.com/relux-works/curator-skill-registry"
+Specification = "https://github.com/relux-works/curator-spec/blob/main/protocol/registry.md"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

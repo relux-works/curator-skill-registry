@@ -3,17 +3,45 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from csk_registry import signing
+from csk_registry import (
+    COMMAND_NAME,
+    HOME_ENV,
+    LEGACY_COMMAND_NAME,
+    LEGACY_HOME_ENV,
+    home_from_env,
+    signing,
+)
 from csk_registry.app import create_app
 from csk_registry.auth import Auditor, AuditorTokens
+from csk_registry.cli import build_parser
 from csk_registry.protocol import ProtocolError, portable_path, validate_record, validate_source_identity
 from csk_registry.snapshot import build_snapshot
 from csk_registry.store import Store
+
+
+def test_public_project_and_cli_identity(monkeypatch: pytest.MonkeyPatch):
+    project_root = Path(__file__).parents[1]
+    project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["name"] == COMMAND_NAME
+    assert project["scripts"][COMMAND_NAME] == "csk_registry.cli:main"
+    assert project["scripts"][LEGACY_COMMAND_NAME] == "csk_registry.cli:main"
+    assert project["urls"]["Repository"] == "https://github.com/relux-works/curator-skill-registry"
+
+    monkeypatch.delenv(HOME_ENV, raising=False)
+    monkeypatch.delenv(LEGACY_HOME_ENV, raising=False)
+    assert build_parser().prog == COMMAND_NAME
+    assert build_parser().parse_args(["genkey"]).home == "./data"
+
+    monkeypatch.setenv(LEGACY_HOME_ENV, "/legacy")
+    assert home_from_env() == "/legacy"
+    monkeypatch.setenv(HOME_ENV, "/current")
+    assert home_from_env() == "/current"
 
 
 def _body(status: str = "audited", **overrides: object) -> dict[str, object]:
@@ -143,8 +171,10 @@ def _client(tmp_path: Path) -> tuple[TestClient, signing.SigningKey, str]:
 
 def test_endpoints_health_and_meta(tmp_path: Path):
     client, key, _ = _client(tmp_path)
+    assert client.app.title == "Curator Skill Registry"  # type: ignore[attr-defined]
     assert client.get("/health").json() == {"status": "ok"}
     meta = client.get("/v1/meta").json()
+    assert meta["name"] == COMMAND_NAME
     assert key.public_pinned in meta["public_keys"]
 
 

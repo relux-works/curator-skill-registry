@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import secrets
 import sys
 from pathlib import Path
 
+from . import COMMAND_NAME, HOME_ENV, home_from_env
+from .bundle import export_bundle, import_bundle
 from .clock import utc_now
 from .protocol import load_json, validate_record
 from .signing import export_key_pem, generate_key, load_key
 from .snapshot import build_snapshot
 from .store import Store
-from .bundle import export_bundle, import_bundle
 
 
 def _home(args: argparse.Namespace) -> Path:
@@ -120,16 +122,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     from .app import app_from_env
 
-    import os
-
-    os.environ.setdefault("CSK_REGISTRY_HOME", args.home)
+    os.environ[HOME_ENV] = args.home
     uvicorn.run(app_from_env(), host=args.host, port=args.port)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="csk-registry", description="CocoaSkills audit registry admin tool")
-    parser.add_argument("--home", default="./data", help="registry data directory")
+    parser = argparse.ArgumentParser(prog=COMMAND_NAME, description="Curator Skill Registry administration tool")
+    parser.add_argument("--home", default=home_from_env(), help="registry data directory")
     sub = parser.add_subparsers(dest="command", required=True)
 
     genkey = sub.add_parser("genkey", help="generate the registry signing key")

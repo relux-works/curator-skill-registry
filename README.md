@@ -1,15 +1,14 @@
-# Curator Audit Registry
+# Curator Skill Registry
 
 An implementation of the open
-[Curator Audit Registry Protocol](https://github.com/relux-works/curator-spec/blob/main/protocol/registry.md).
+[Curator Protocol registry profile](https://github.com/relux-works/curator-spec/blob/main/protocol/registry.md).
 It serves signed statements that a skill at a specific commit and content hash
 was audited or revoked, and maintains an append-only transparency log with a
 signed snapshot.
 
 Anyone can deploy it on a public or closed network. A conforming Curator client
 pins the registries it trusts and verifies every record against out-of-band
-Ed25519 keys before trusting it. The distribution and executable retain their
-existing `cocoaskills-registry` and `csk-registry` compatibility names.
+Ed25519 keys before trusting it.
 
 ## Model
 
@@ -30,22 +29,22 @@ existing `cocoaskills-registry` and `csk-registry` compatibility names.
 ## Run
 
 ```bash
-pip install cocoaskills-registry
+pip install curator-skill-registry
 
 # One-time: generate the signing key and register an auditor.
-csk-registry --home ./data genkey
-csk-registry --home ./data issue-token acme-security \
+curator-skill-registry --home ./data genkey
+curator-skill-registry --home ./data issue-token acme-security \
   --org "Acme Security" --public-key ed25519:<auditor-public-key>
 
 # Serve.
-csk-registry --home ./data serve --host 127.0.0.1 --port 8082
+curator-skill-registry --home ./data serve --host 127.0.0.1 --port 8082
 ```
 
 Or with Docker:
 
 ```bash
 docker compose up -d
-docker compose exec registry csk-registry --home /data genkey
+docker compose exec registry curator-skill-registry --home /data genkey
 ```
 
 ## Endpoints
@@ -65,14 +64,18 @@ HTTPS; plain HTTP is reserved for explicitly configured loopback deployments.
 ## Admin CLI
 
 ```bash
-csk-registry --home ./data genkey            # generate the signing key
-csk-registry --home ./data issue-token <id>  # issue an auditor token
-csk-registry --home ./data sign-record       # sign a record body from stdin
-csk-registry --home ./data export-snapshot   # print a signed snapshot
-csk-registry --home ./data export-bundle     # export a signed bundle of all records
-csk-registry --home ./data import-bundle <f> --upstream-key <k>  # import an upstream bundle
-csk-registry --home ./data verify-chain      # verify the log hash chain
+curator-skill-registry --home ./data genkey            # generate the signing key
+curator-skill-registry --home ./data issue-token <id>  # issue an auditor token
+curator-skill-registry --home ./data sign-record       # sign a record body from stdin
+curator-skill-registry --home ./data export-snapshot   # print a signed snapshot
+curator-skill-registry --home ./data export-bundle     # export a signed bundle of all records
+curator-skill-registry --home ./data import-bundle <f> --upstream-key <k>  # import a bundle
+curator-skill-registry --home ./data verify-chain      # verify the log hash chain
 ```
+
+`CURATOR_SKILL_REGISTRY_HOME` sets the default data directory. During the 0.x
+migration, the former `csk-registry` command and `CSK_REGISTRY_HOME` variable
+remain supported as compatibility aliases; the new names take precedence.
 
 ## Development
 
