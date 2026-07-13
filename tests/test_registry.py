@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from csk_registry import signing
 from csk_registry.app import create_app
 from csk_registry.auth import Auditor, AuditorTokens
+from csk_registry.protocol import ProtocolError, portable_path, validate_record, validate_source_identity
 from csk_registry.snapshot import build_snapshot
 from csk_registry.store import Store
 
@@ -41,6 +42,35 @@ def test_signing_matches_client_canonical_form():
     ).encode("utf-8")
     assert signing.canonical_bytes(record) == expected
     assert signing.verify(key.public_pinned, expected, record["sig"]["signature"])
+
+
+@pytest.mark.parametrize(
+    "source_identity",
+    [
+        "GitLab.example.com/skills/a",
+        "gitlab.example.com/skills/a b",
+        "gitlab.example.com/skills/a#fragment",
+    ],
+)
+def test_record_rejects_noncanonical_source_identity(source_identity: str):
+    key = signing.generate_key()
+    with pytest.raises(ProtocolError, match="source_identity"):
+        validate_record(key.sign_record(_body(source_identity=source_identity)))
+
+
+def test_source_identity_and_portable_path_boundaries():
+    assert validate_source_identity("gitlab.example.com/skills/文書") == "gitlab.example.com/skills/文書"
+    assert portable_path("directory with space/file name.md")
+    for value in ("scripts/", "a//b", "control\u0085name", "stream:name"):
+        assert not portable_path(value)
+
+
+def test_record_rejects_malformed_signature_envelope():
+    key = signing.generate_key()
+    record = key.sign_record(_body())
+    record["sig"]["signature"] = "not-base64"
+    with pytest.raises(ProtocolError, match="signature"):
+        validate_record(record)
 
 
 def test_store_append_and_lookup(tmp_path: Path):

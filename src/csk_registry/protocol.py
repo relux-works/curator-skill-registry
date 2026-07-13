@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
+import unicodedata
 from typing import Any
 
 from .signing import MAX_SAFE_INTEGER, canonical_document_bytes
@@ -9,7 +12,7 @@ from .signing import MAX_SAFE_INTEGER, canonical_document_bytes
 
 STATUSES = {"audited", "revoked", "deprecated", "pending"}
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+_HOST = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEX256 = re.compile(r"^[0-9a-f]{64}$")
@@ -40,8 +43,8 @@ def load_json(raw: bytes | str) -> Any:
 
     def parse_integer(text: str) -> int:
         value = int(text)
-        if not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
-            raise ProtocolError(f"JSON integer outside safe range: {text}")
+        if text == "-0" or not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+            raise ProtocolError(f"JSON integer is not shortest-form or safe: {text}")
         return value
 
     def reject_number(text: str) -> None:
@@ -104,7 +107,11 @@ def validate_record(record: Any) -> dict[str, Any]:
     for endorsement in endorsements:
         if not isinstance(endorsement, dict) or set(endorsement) != {"endorser", "sig"}:
             raise ProtocolError("audit record endorsement is malformed")
-        if not isinstance(endorsement.get("endorser"), str) or not endorsement["endorser"]:
+        if (
+            not isinstance(endorsement.get("endorser"), str)
+            or not endorsement["endorser"]
+            or len(endorsement["endorser"]) > 8192
+        ):
             raise ProtocolError("audit record endorsement requires an endorser")
         validate_signature(endorsement.get("sig"))
     canonical_document_bytes(record)
@@ -121,6 +128,12 @@ def validate_signature(value: Any) -> None:
     if not isinstance(key_id, str) or _KEY_ID.fullmatch(key_id) is None:
         raise ProtocolError("signature key_id is malformed")
     if not isinstance(signature, str):
+        raise ProtocolError("signature value is malformed")
+    try:
+        raw = base64.b64decode(signature, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ProtocolError("signature value is malformed") from exc
+    if len(raw) != 64 or base64.b64encode(raw).decode("ascii") != signature:
         raise ProtocolError("signature value is malformed")
 
 
@@ -163,14 +176,24 @@ def validate_source_identity(value: Any) -> str:
     if not isinstance(value, str) or len(value) > 4096:
         raise ProtocolError("source_identity must be canonical")
     host, separator, path = value.partition("/")
-    if not separator or _HOST.fullmatch(host) is None or not portable_path(path):
+    if (
+        not separator
+        or _HOST.fullmatch(host) is None
+        or not portable_path(path)
+        or any(character.isspace() or character in "%?#" for character in path)
+    ):
         raise ProtocolError("source_identity must be canonical")
     return value
 
 
 def _portable_component(value: str) -> bool:
-    if not value or value in {".", ".."} or value.endswith((" ", ".")) or ":" in value:
+    if (
+        not value
+        or value in {".", ".."}
+        or value.endswith((" ", "."))
+        or any(separator in value for separator in (":", "/", "\\"))
+    ):
         return False
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+    if any(unicodedata.category(character) == "Cc" for character in value):
         return False
     return value.split(".", 1)[0].casefold() not in _WINDOWS_RESERVED
