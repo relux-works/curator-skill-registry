@@ -1,14 +1,14 @@
 services:
   registry:
     build: .
-    image: cocoaskills-registry:latest
+    image: curator-skill-registry:latest
     restart: unless-stopped
     ports:
       - "127.0.0.1:18082:8082"
     volumes:
       - registry-data:/data
     environment:
-      CSK_REGISTRY_HOME: /data
+      CURATOR_SKILL_REGISTRY_HOME: /data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/health').status==200 else 1)"]
       interval: 30s

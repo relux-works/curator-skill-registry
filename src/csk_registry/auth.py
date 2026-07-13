@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .permissions import require_private_file
+from .protocol import load_json
 from .signing import parse_public_key
 
 
@@ -24,19 +26,45 @@ class Auditor:
 
 class AuditorTokens:
     def __init__(self, auditors: list[Auditor]) -> None:
+        auditor_ids: set[str] = set()
+        token_digests: set[str] = set()
         for auditor in auditors:
+            if (
+                not auditor.auditor_id
+                or len(auditor.auditor_id) > 8192
+                or re.search(r"[\x00-\x1f\x7f]", auditor.auditor_id)
+            ):
+                raise ValueError("auditor_id must be a non-empty control-free string")
+            if not isinstance(auditor.org, str) or len(auditor.org) > 8192:
+                raise ValueError(f"auditor {auditor.auditor_id!r} has an invalid organization")
             parse_public_key(auditor.public_pinned)
             if len(auditor.token_sha256) != 64 or any(
                 character not in "0123456789abcdef" for character in auditor.token_sha256
             ):
                 raise ValueError(f"auditor {auditor.auditor_id!r} has an invalid token digest")
+            if auditor.auditor_id in auditor_ids:
+                raise ValueError(f"duplicate auditor_id {auditor.auditor_id!r}")
+            if auditor.token_sha256 in token_digests:
+                raise ValueError("two auditors cannot share one token digest")
+            auditor_ids.add(auditor.auditor_id)
+            token_digests.add(auditor.token_sha256)
         self._by_hash = {auditor.token_sha256: auditor for auditor in auditors}
 
     @classmethod
     def from_file(cls, path: Path) -> "AuditorTokens":
         if not path.exists():
             return cls([])
-        data = json.loads(path.read_text(encoding="utf-8"))
+        require_private_file(path)
+        data = load_json(path.read_bytes())
+        if not isinstance(data, dict) or set(data) != {"auditors"}:
+            raise ValueError("auditors file must contain exactly one auditors array")
+        if not isinstance(data["auditors"], list):
+            raise ValueError("auditors must be an array")
+        for item in data["auditors"]:
+            if not isinstance(item, dict) or not {"auditor_id", "public_key", "token_sha256"}.issubset(item):
+                raise ValueError("auditor entry is malformed")
+            if set(item) - {"auditor_id", "org", "public_key", "token_sha256"}:
+                raise ValueError("auditor entry contains an unknown field")
         auditors = [
             Auditor(
                 auditor_id=item["auditor_id"],
@@ -44,7 +72,7 @@ class AuditorTokens:
                 public_pinned=item["public_key"],
                 token_sha256=item["token_sha256"],
             )
-            for item in data.get("auditors", [])
+            for item in data["auditors"]
         ]
         return cls(auditors)
 
