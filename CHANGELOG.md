@@ -33,6 +33,28 @@
 
 ### Security
 
+- R2: snapshot-boundary lookups no longer rescan the log or rebuild the
+  Merkle tree per request. Each append now memoizes its boundary tuple
+  `(log_size, head, merkle_root, created_at)` in a durable `boundaries`
+  row in the same transaction (schema version 3, backfilled once at
+  startup), and `snapshot_boundary(max_seq)`, `boundary_available()`, and
+  the cursor carried-boundary check read one row (O(1)) with O(1)
+  structural anchors instead of recomputing. Appends maintain an
+  incremental Merkle frontier (O(log n) hashes, byte-identical roots).
+  The memoized rows are revalidated against the recomputed chain at every
+  startup, and a disagreement fails readiness like any other §5 mismatch;
+  the cache is never trusted over the log. `GET /health` no longer
+  re-verifies the chain per probe either: it serves a cached integrity
+  verdict refreshed by a background full verifier (chain, ledgers, and
+  boundary-cache agreement) every `--health-verify-interval` seconds
+  (default 300, `CURATOR_SKILL_REGISTRY_HEALTH_VERIFY_INTERVAL`), while
+  each append advances the verified head incrementally (after COMMIT, and
+  only after the cheap frontier/head anchors validate). A failed refresh
+  latches non-ready and disables writes like a startup §5 mismatch until
+  a restart re-verifies; a pass that has not completed within twice the
+  interval also reports `503 not_ready` (fail closed on a hung verifier)
+  but recovers on the next successful pass without a restart. The success
+  envelope is unchanged (`health-response-v1`) (curator-spec `dced9b8`).
 - R1: `GET /v1/records` and `GET /v1/log` page envelopes now carry the
   REQUIRED `boundary` member: the complete signed snapshot object
   (`registry-snapshot-v1`, all fields including `sig`) at which the page was

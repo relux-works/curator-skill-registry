@@ -157,6 +157,38 @@ window. Startup refuses unexpired unscoped entries because assigning them to an
 auditor would be ambiguous. Expired entries are discarded while the schema is
 migrated; log history is unchanged.
 
+Schema version 3 adds two cache tables, `boundaries` (one memoized
+`(log_size, head, merkle_root, created_at)` row per committed prefix) and
+`merkle_frontier` (the O(log n) incremental-tree state for appends). The first
+startup on an older database creates both tables and backfills them from the
+log in one idempotent pass as part of startup verification; the memoized rows
+are revalidated against the recomputed chain on every startup, and any
+disagreement fails readiness. Reopening the database retries an interrupted
+migration without changing log history. Expect the first post-upgrade startup
+to take longer on large logs (one chain walk plus incremental Merkle work);
+steady-state startups revalidate without rewriting, and per-request reads are
+single-row lookups.
+
+`GET /health` serves a cached integrity verdict, so probes stay cheap no
+matter how large the log grows. A background verifier re-verifies the full
+chain, the idempotency/import ledgers, and the boundary-cache agreement every
+`--health-verify-interval` seconds (default 300;
+`CURATOR_SKILL_REGISTRY_HEALTH_VERIFY_INTERVAL` when the flag is absent),
+reading through its own connection so a pass never blocks appends; each
+append advances the verified head incrementally. Size the interval
+comfortably above the full-walk duration of your log — time
+`curator-skill-registry --home <dir> verify-chain` as a proxy for one pass.
+A pass that has not completed within twice the interval makes `/health`
+report `503 not_ready`, so a hung verifier can never leave a green verdict
+forever. Staleness is transient: the next successful pass restores readiness
+and writes automatically (check the `health_refresh` audit events for
+outcome, duration, and log size; raise the interval if passes routinely
+overrun it). A `503 not_ready` caused by corruption or a failed pass latches
+instead — readiness and writes stay disabled until a restart re-verifies;
+repair the store offline first, since history is never truncated or
+rewritten automatically. Writes refused while non-ready report `503
+storage_unavailable`.
+
 Private state is fail-closed. On POSIX, the data home is `0700` and private
 files are `0600`. On Windows, the service replaces inherited permissions with
 a protected DACL that grants full access only to the current service identity;

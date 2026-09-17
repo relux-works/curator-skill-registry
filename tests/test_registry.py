@@ -1246,3 +1246,1017 @@ def test_store_page_calls_verify_carried_boundary(tmp_path: Path):
             max_seq=boundary.log_size,
             boundary=boundary,
         )
+
+
+def _counting_merkle_hasher(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    import csk_registry.store as store_module
+
+    calls: list[int] = [0]
+    real = store_module._merkle_pair_hash
+
+    def counting(left: bytes, right: bytes) -> bytes:
+        calls[0] += 1
+        return real(left, right)
+
+    monkeypatch.setattr(store_module, "_merkle_pair_hash", counting)
+    return calls
+
+
+def _seed_paginated_store(store: Store, key: signing.SigningKey, count: int) -> str:
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(count):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index:03d}")),
+            created_at=f"2026-07-13T00:{index // 60:02d}:{index % 60:02d}Z",
+        )
+    return content_hash
+
+
+def test_merkle_frontier_matches_naive_root() -> None:
+    import csk_registry.store as store_module
+
+    leaves = [hashlib.sha256(f"leaf-{index}".encode()).hexdigest() for index in range(100)]
+    frontier: list[store_module._FrontierLevel] = []
+    for index, leaf in enumerate(leaves):
+        root = store_module._frontier_append(frontier, bytes.fromhex(leaf)).hex()
+        assert root == store_module._merkle_root(leaves[: index + 1])
+
+
+def test_boundary_reads_perform_zero_merkle_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csk_registry.store as store_module
+
+    path = tmp_path / "memo.db"
+    store = Store(path)
+    registry_key = signing.generate_key()
+    content_hash = _seed_paginated_store(store, registry_key, 32)
+    # The one append after which every read must be hash-free.
+    store.append(
+        registry_key.sign_record(_body(name="skill-trigger")),
+        created_at="2026-07-13T01:00:00Z",
+    )
+    # Correctness oracle captured before the hasher is instrumented.
+    entry_hashes = [
+        str(row["entry_hash"])
+        for row in store._conn.execute(  # type: ignore[attr-defined]
+            "SELECT entry_hash FROM log ORDER BY seq"
+        )
+    ]
+    expected_roots = {
+        size: store_module._merkle_root(entry_hashes[:size]) for size in (1, 7, 33)
+    }
+    for size, root in expected_roots.items():
+        assert store.snapshot_boundary(size).merkle_root == root
+
+    client = TestClient(
+        create_app(store=store, signing_key=registry_key, tokens=AuditorTokens([]))
+    )
+    calls = _counting_merkle_hasher(monkeypatch)
+    boundary = store.snapshot_boundary()
+    assert store.boundary_available(boundary)
+
+    def _read_everything() -> None:
+        first_records = client.get(
+            "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+        )
+        assert first_records.status_code == 200
+        records_cursor = first_records.json()["next_cursor"]
+        assert records_cursor
+        continued_records = client.get(
+            "/v1/records",
+            params={"content_sha256": content_hash, "limit": 1, "cursor": records_cursor},
+        )
+        assert continued_records.status_code == 200
+        first_log = client.get("/v1/log", params={"since": 0, "limit": 1})
+        assert first_log.status_code == 200
+        log_cursor = first_log.json()["next_cursor"]
+        assert log_cursor
+        continued_log = client.get(
+            "/v1/log", params={"since": 0, "limit": 1, "cursor": log_cursor}
+        )
+        assert continued_log.status_code == 200
+        assert client.get("/v1/snapshot").status_code == 200
+        assert store.snapshot_boundary().merkle_root == expected_roots[33]
+        assert store.snapshot_boundary(7).merkle_root == expected_roots[7]
+        assert store.boundary_available(boundary)
+        assert store.merkle_root() == expected_roots[33]
+        assert store.head()[0] == 33
+        assert store.checkpoint_matches(boundary)
+        found, _ = store.records_page(
+            content_sha256=content_hash, limit=5, offset=0, boundary=boundary
+        )
+        assert found
+        entries, _ = store.log_page(since=0, limit=5, offset=0, boundary=boundary)
+        assert entries
+
+    for _ in range(3):
+        _read_everything()
+    assert calls[0] == 0, f"reads recomputed the Merkle tree ({calls[0]} hashes)"
+
+    # Durability: the same zero-hash reads hold after a restart, which
+    # revalidates the cache against the log once before serving.
+    monkeypatch.undo()
+    store.close()
+    reopened = Store(path)
+    reopened_client = TestClient(
+        create_app(store=reopened, signing_key=registry_key, tokens=AuditorTokens([]))
+    )
+    calls_after_restart = _counting_merkle_hasher(monkeypatch)
+    for _ in range(2):
+        assert reopened_client.get("/v1/snapshot").status_code == 200
+        assert reopened.snapshot_boundary().merkle_root == expected_roots[33]
+        assert reopened.boundary_available(boundary)
+    assert calls_after_restart[0] == 0
+
+
+def test_boundary_append_cost_is_logarithmic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csk_registry.store as store_module
+
+    store = Store(tmp_path / "append.db")
+    key = signing.generate_key()
+    _seed_paginated_store(store, key, 64)
+    calls = _counting_merkle_hasher(monkeypatch)
+    entry = store.append(
+        key.sign_record(_body(name="skill-065")),
+        created_at="2026-07-13T02:00:00Z",
+    )
+    assert entry.seq == 65
+    # One pair-hash per tree level: ~log2(n), far below the naive O(n).
+    assert 1 <= calls[0] <= 16, f"append used {calls[0]} Merkle hashes for 65 leaves"
+    monkeypatch.undo()
+    entry_hashes = [
+        str(row["entry_hash"])
+        for row in store._conn.execute(  # type: ignore[attr-defined]
+            "SELECT entry_hash FROM log ORDER BY seq"
+        )
+    ]
+    assert store.snapshot_boundary().merkle_root == store_module._merkle_root(entry_hashes)
+
+
+def test_boundary_cache_disagreement_fails_startup_but_missing_row_backfills(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cache.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(3):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    genuine = store.snapshot_boundary()
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE boundaries SET merkle_root = ? WHERE log_size = 3", ("ff" * 32,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(StoreIntegrityError, match="disagrees with the committed log"):
+        Store(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE boundaries SET merkle_root = ? WHERE log_size = 3",
+            (genuine.merkle_root,),
+        )
+        connection.execute("DELETE FROM boundaries WHERE log_size = 2")
+        connection.execute("DELETE FROM merkle_frontier")
+        connection.commit()
+    finally:
+        connection.close()
+    healed = Store(path)
+    try:
+        assert healed.snapshot_boundary() == genuine
+        assert healed.snapshot_boundary(2).head == store_module_head(healed, 2)
+    finally:
+        healed.close()
+
+
+def store_module_head(store: Store, seq: int) -> str:
+    row = store._conn.execute(  # type: ignore[attr-defined]
+        "SELECT entry_hash FROM log WHERE seq = ?", (seq,)
+    ).fetchone()
+    assert row is not None
+    return str(row["entry_hash"])
+
+
+def test_v2_database_migrates_and_backfills_boundaries(tmp_path: Path) -> None:
+    import csk_registry.store as store_module
+
+    path = tmp_path / "v2.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(5):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    entry_hashes = [
+        str(row["entry_hash"])
+        for row in store._conn.execute(  # type: ignore[attr-defined]
+            "SELECT entry_hash FROM log ORDER BY seq"
+        )
+    ]
+    expected = [store_module._merkle_root(entry_hashes[: size]) for size in range(1, 6)]
+    store.close()
+
+    # Downgrade the file to the pre-R2 v2 shape: no cache tables, v2 markers.
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE boundaries")
+        connection.execute("DROP TABLE merkle_frontier")
+        connection.execute("UPDATE metadata SET value = '2' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    upgraded = Store(path)
+    try:
+        marker = upgraded._conn.execute(  # type: ignore[attr-defined]
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert marker["value"] == "3"
+        version = upgraded._conn.execute("PRAGMA user_version").fetchone()[0]  # type: ignore[attr-defined]
+        assert int(version) == 3
+        for size, root in enumerate(expected, start=1):
+            assert upgraded.snapshot_boundary(size).merkle_root == root
+        upgraded.append(
+            key.sign_record(_body(name="skill-5")),
+            created_at="2026-07-13T00:00:05Z",
+        )
+        assert upgraded.head()[0] == 6
+    finally:
+        upgraded.close()
+
+
+def _counting_store_sha256(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count ``hashlib.sha256`` calls made through the store module only."""
+    import csk_registry.store as store_module
+
+    calls: list[int] = [0]
+    real_sha256 = hashlib.sha256
+
+    class _Hashlib:
+        @staticmethod
+        def sha256(*args: object, **kwargs: object) -> object:
+            calls[0] += 1
+            return real_sha256(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_module, "hashlib", _Hashlib)
+    return calls
+
+
+def _counting_store_canonical_bytes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    import csk_registry.store as store_module
+
+    calls: list[int] = [0]
+    real = store_module.canonical_bytes
+
+    def counting(record: object) -> bytes:
+        calls[0] += 1
+        return real(record)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_module, "canonical_bytes", counting)
+    return calls
+
+
+def _health_client(
+    tmp_path: Path, *, health_verify_interval: float | None = None
+) -> tuple[TestClient, Store, signing.SigningKey, signing.SigningKey, str]:
+    kwargs: dict[str, object] = (
+        {} if health_verify_interval is None else {"health_verify_interval": health_verify_interval}
+    )
+    store = Store(tmp_path / "r.db", **kwargs)  # type: ignore[arg-type]
+    key = signing.generate_key()
+    auditor_key = signing.generate_key()
+    token = "health-token-with-at-least-128-bit-capacity"
+    tokens = AuditorTokens(
+        [
+            Auditor(
+                auditor_id="a1",
+                org="Example",
+                public_pinned=auditor_key.public_pinned,
+                token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+            )
+        ]
+    )
+    return TestClient(create_app(store=store, signing_key=key, tokens=tokens)), store, key, auditor_key, token
+
+
+def _tamper_log_entry_hash(path: Path, seq: int, entry_hash: str) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("UPDATE log SET entry_hash = ? WHERE seq = ?", (entry_hash, seq))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_health_probes_perform_zero_hash_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "health.db")
+    key = signing.generate_key()
+    _seed_paginated_store(store, key, 8)
+    client = TestClient(
+        create_app(store=store, signing_key=key, tokens=AuditorTokens([]))
+    )
+    assert client.get("/health").json() == {"status": "ok"}
+
+    sha_calls = _counting_store_sha256(monkeypatch)
+    ccj_calls = _counting_store_canonical_bytes(monkeypatch)
+    merkle_calls = _counting_merkle_hasher(monkeypatch)
+    for _ in range(5):
+        assert client.get("/health").json() == {"status": "ok"}
+    assert sha_calls[0] == 0, f"probes hashed {sha_calls[0]} times"
+    assert ccj_calls[0] == 0, f"probes canonicalized {ccj_calls[0]} records"
+    assert merkle_calls[0] == 0
+
+    # Appends advance the cached head incrementally; later probes stay hash-free.
+    store.append(
+        key.sign_record(_body(name="skill-008")),
+        created_at="2026-07-13T01:00:00Z",
+    )
+    store.append(
+        key.sign_record(_body(name="skill-009")),
+        created_at="2026-07-13T01:01:00Z",
+    )
+    sha_calls[0] = ccj_calls[0] = merkle_calls[0] = 0
+    for _ in range(5):
+        assert client.get("/health").json() == {"status": "ok"}
+    assert sha_calls[0] == 0, f"probes after appends hashed {sha_calls[0]} times"
+    assert ccj_calls[0] == 0
+    assert merkle_calls[0] == 0
+    verdict = store.health_verdict()
+    assert verdict.ready and verdict.error is None
+    assert (verdict.verified_log_size, verdict.verified_head) == store.head()
+    assert verdict.verified_log_size == 10
+
+
+def test_health_first_verdict_is_startup_verification(tmp_path: Path) -> None:
+    path = tmp_path / "first.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(3):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    size, head = store.head()
+    store.close()
+
+    # No refresh driven, no verifier thread: readiness comes from startup §5.
+    reopened = Store(path)
+    try:
+        assert not reopened.health_verifier_running()
+        client = TestClient(
+            create_app(store=reopened, signing_key=key, tokens=AuditorTokens([]))
+        )
+        assert client.get("/health").json() == {"status": "ok"}
+        verdict = reopened.health_verdict()
+        assert verdict.ready and verdict.error is None
+        assert verdict.verified_head == head
+        assert verdict.verified_log_size == size == 3
+        assert verdict.verified_at
+    finally:
+        reopened.close()
+
+
+def test_health_corruption_detected_at_next_refresh_disables_writes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, store, key, auditor_key, token = _health_client(tmp_path)
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (
+        client.post("/v1/records", json=auditor_key.sign_record(_body("audited")), headers=headers).status_code
+        == 201
+    )
+    assert client.get("/health").status_code == 200
+
+    _tamper_log_entry_hash(tmp_path / "r.db", 1, "ff" * 32)
+    # Cached verdict: still green until the next refresh (driven explicitly,
+    # no sleeps, no background thread in this test).
+    assert client.get("/health").status_code == 200
+
+    caplog.set_level(logging.INFO, logger="csk_registry.audit")
+    caplog.clear()
+    verdict = store.refresh_health_verdict()
+    assert not verdict.ready
+    assert verdict.error
+
+    failed = client.get("/health")
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "not_ready"
+    refused = client.post(
+        "/v1/records", json=auditor_key.sign_record(_body("revoked")), headers=headers
+    )
+    assert refused.status_code == 503
+    assert refused.json()["error"]["code"] == "storage_unavailable"
+    with pytest.raises(StoreIntegrityError, match="restart to re-verify"):
+        store.append(
+            key.sign_record(_body(name="skill-blocked")),
+            created_at="2026-07-13T02:00:00Z",
+        )
+    # Latched: a second pass stays failed without a restart.
+    assert not store.refresh_health_verdict().ready
+
+    refresh_events = []
+    for record in caplog.records:
+        if record.name != "csk_registry.audit":
+            continue
+        try:
+            payload = json.loads(record.getMessage())
+        except ValueError:
+            continue
+        if payload.get("event") == "health_refresh":
+            refresh_events.append(payload)
+    assert [event["result"] for event in refresh_events] == [
+        "integrity_failed",
+        "integrity_failed_latched",
+    ]
+    assert refresh_events[0]["log_size"] == 1
+    assert refresh_events[0]["duration_ms"] >= 0
+    assert refresh_events[0]["error_count"] >= 1
+    assert refresh_events[0]["error"]
+
+
+class _ManualStoreClock:
+    """Injectable ``time`` replacement for deterministic staleness tests."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_health_stale_verifier_fails_closed_and_refresh_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csk_registry.store as store_module
+
+    client, store, key, auditor_key, token = _health_client(
+        tmp_path, health_verify_interval=10.0
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (
+        client.post("/v1/records", json=auditor_key.sign_record(_body("audited")), headers=headers).status_code
+        == 201
+    )
+    assert client.get("/health").status_code == 200
+
+    # Deterministic clock: the stale bound is 2 × 10 = 20 s. No sleeps.
+    base = store._health_last_refresh_monotonic
+    clock = _ManualStoreClock(base)
+    monkeypatch.setattr(store_module, "time", clock)
+
+    # (a) Exact boundary: age == bound is still fresh; age > bound is stale.
+    clock.now = base + 20.0
+    assert client.get("/health").status_code == 200
+    store.append(
+        key.sign_record(_body(name="skill-at-bound")),
+        created_at="2026-07-13T02:00:00Z",
+    )
+    clock.now = base + 20.001
+    stale = client.get("/health")
+    assert stale.status_code == 503
+    assert stale.json()["error"]["code"] == "not_ready"
+    with pytest.raises(StoreIntegrityError, match="stale"):
+        store.append(
+            key.sign_record(_body(name="skill-stale")),
+            created_at="2026-07-13T02:00:01Z",
+        )
+
+    # (b) Late completion of the stalled verifier restores readiness without
+    # a restart (staleness is transient; only failure/corruption latches).
+    assert store.refresh_health_verdict().ready
+    assert client.get("/health").status_code == 200
+    assert (
+        client.post("/v1/records", json=auditor_key.sign_record(_body("revoked")), headers=headers).status_code
+        == 201
+    )
+    # Still fresh just inside the new bound, stale again past it.
+    renewed = store._health_last_refresh_monotonic
+    clock.now = renewed + 20.0
+    assert client.get("/health").status_code == 200
+    clock.now = renewed + 20.001
+    assert client.get("/health").status_code == 503
+
+
+def test_health_stalled_verifier_failure_stays_latched_until_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csk_registry.store as store_module
+
+    path = tmp_path / "r.db"
+    client, store, key, _, _ = _health_client(tmp_path, health_verify_interval=10.0)
+    store.append(
+        key.sign_record(_body(name="skill-0")),
+        created_at="2026-07-13T00:00:00Z",
+    )
+    genuine = store_module_head(store, 1)
+    assert client.get("/health").status_code == 200
+
+    # Stall past the bound, then corrupt: the completion FAILS.
+    base = store._health_last_refresh_monotonic
+    clock = _ManualStoreClock(base + 20.001)
+    monkeypatch.setattr(store_module, "time", clock)
+    assert client.get("/health").status_code == 503
+    _tamper_log_entry_hash(path, 1, "ff" * 32)
+    failed = store.refresh_health_verdict()
+    assert not failed.ready
+    assert "hash" in (failed.error or "")
+
+    # (c) A failed completion latches: restoring a fresh clock does not
+    # recover, and neither does repairing + refreshing without a restart.
+    monkeypatch.undo()
+    assert client.get("/health").status_code == 503
+    with pytest.raises(StoreIntegrityError, match="restart to re-verify"):
+        store.append(
+            key.sign_record(_body(name="skill-blocked")),
+            created_at="2026-07-13T02:00:00Z",
+        )
+    _tamper_log_entry_hash(path, 1, genuine)
+    assert not store.refresh_health_verdict().ready
+    assert client.get("/health").status_code == 503
+    store.close()
+
+    healed = Store(path)
+    try:
+        assert healed.health_verdict().ready
+        assert healed.head()[0] == 1
+    finally:
+        healed.close()
+
+
+def test_health_refresh_sees_concurrent_append_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Correction 1: a valid append committing between the verifier's chain
+    # walk and its frontier load must not false-positive as corruption. The
+    # whole pass reads under one WAL snapshot; the interleaved append stays
+    # invisible to it and is trusted transitively via its anchor checks.
+    client, store, key, _, _ = _health_client(tmp_path)
+    record = key.sign_record(_body())
+    store.append(record, created_at="2026-07-13T02:00:00Z")
+    original = store._load_frontier
+    injected: list[bool] = [False]
+
+    def interleaved(conn: object = None) -> object:
+        if conn is not None and not injected[0]:
+            injected[0] = True
+            store.append(record, created_at="2026-07-13T02:00:01Z")
+        return original(conn)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "_load_frontier", interleaved)
+    verdict = store.refresh_health_verdict()
+    assert injected[0]
+    assert store.integrity_errors() == []
+    assert verdict.ready, verdict.error
+    assert verdict.verified_log_size == 2
+    assert client.get("/health").status_code == 200
+
+
+def test_health_append_refuses_corrupted_frontier_and_latches(
+    tmp_path: Path,
+) -> None:
+    # Correction 2: length-preserving level-0 tail tampering after three
+    # entries must refuse the fourth append through the production entry,
+    # flip /health to 503, and leave the committed boundary intact (no wrong
+    # immutable root, no green attestation). No full-chain hashing per
+    # request: the anchors are O(1) rows + O(log n) hashes.
+    import csk_registry.store as store_module
+
+    path = tmp_path / "r.db"
+    client, store, key, _, _ = _health_client(tmp_path)
+    record = key.sign_record(_body())
+    for _ in range(3):
+        store.append(record, created_at="2026-07-13T02:00:00Z")
+    assert client.get("/health").status_code == 200
+    good_root = store.snapshot_boundary().merkle_root
+    good_head = store.head()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE merkle_frontier SET tail = ? WHERE level = 0",
+            ('["' + "f" * 64 + '","' + "e" * 64 + '"]',),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreIntegrityError, match="frontier"):
+        store.append(record, created_at="2026-07-13T02:00:01Z")
+    failed = client.get("/health")
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "not_ready"
+    # Nothing committed: head still 3 and the boundary root is the genuine one.
+    assert store.head() == good_head
+    assert store.snapshot_boundary().merkle_root == good_root
+    expected = store_module._merkle_root(
+        [entry.entry_hash for entry in store.log_entries()]
+    )
+    assert good_root == expected
+    # Latched: stays non-ready until a restart re-verifies.
+    assert not store.refresh_health_verdict().ready
+
+
+def test_health_rollback_does_not_advance_cached_verdict(tmp_path: Path) -> None:
+    # Correction 3: the cached head advances only after COMMIT. A BEFORE
+    # INSERT trigger that ABORTs the import-ledger write rolls the whole
+    # transaction back; the durable head stays 0 and the verdict must agree.
+    client, store, key, _, _ = _health_client(tmp_path)
+    record = key.sign_record(_body())
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            "CREATE TRIGGER refuse_import BEFORE INSERT ON imported_records "
+            "BEGIN SELECT RAISE(ABORT, 'injected write failure'); END"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(sqlite3.IntegrityError, match="injected write failure"):
+        store.append_imports([("fingerprint", record)], created_at="2026-07-13T02:00:00Z")
+    assert store.head()[0] == 0
+    verdict = store.health_verdict()
+    assert verdict.ready
+    assert verdict.verified_log_size == 0, f"rolled back store reports {verdict}"
+    assert client.get("/health").status_code == 200
+
+
+def test_health_idempotent_rollback_does_not_advance_cached_verdict(
+    tmp_path: Path,
+) -> None:
+    # Correction 3 via the idempotent entry: the ledger INSERT fails after
+    # the log INSERT, the transaction rolls back, and the verdict stays put.
+    client, store, key, _, _ = _health_client(tmp_path)
+    record = key.sign_record(_body())
+    connection = sqlite3.connect(store.path)
+    try:
+        connection.execute(
+            "CREATE TRIGGER refuse_idempotency BEFORE INSERT ON idempotency "
+            "BEGIN SELECT RAISE(ABORT, 'injected idempotency failure'); END"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(sqlite3.IntegrityError, match="injected idempotency failure"):
+        store.append_idempotent(
+            record,
+            auditor_id="a1",
+            key="k1",
+            body_sha256="ab" * 32,
+            created_at="2026-07-13T02:00:00Z",
+            now=1_800_000_000,
+            ttl_seconds=24 * 3600,
+        )
+    assert store.head()[0] == 0
+    verdict = store.health_verdict()
+    assert verdict.ready
+    assert verdict.verified_log_size == 0, f"rolled back store reports {verdict}"
+    assert client.get("/health").status_code == 200
+
+
+def test_health_restart_after_repair_returns_ready(tmp_path: Path) -> None:
+    path = tmp_path / "repair.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(2):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    genuine = store_module_head(store, 1)
+    _tamper_log_entry_hash(path, 1, "ff" * 32)
+    assert not store.refresh_health_verdict().ready
+
+    # Repair behind the back: without a restart the latch holds.
+    _tamper_log_entry_hash(path, 1, genuine)
+    assert not store.refresh_health_verdict().ready
+    store.close()
+
+    healed = Store(path)
+    try:
+        assert healed.health_verdict().ready
+        client = TestClient(
+            create_app(store=healed, signing_key=key, tokens=AuditorTokens([]))
+        )
+        assert client.get("/health").status_code == 200
+        entry = healed.append(
+            key.sign_record(_body(name="skill-2")),
+            created_at="2026-07-13T00:00:02Z",
+        )
+        assert entry.seq == 3
+    finally:
+        healed.close()
+
+
+def test_health_append_advances_verified_head_without_full_refresh(tmp_path: Path) -> None:
+    store = Store(tmp_path / "incremental.db")
+    key = signing.generate_key()
+    store.append(key.sign_record(_body(name="skill-0")), created_at="2026-07-13T00:00:00Z")
+    before = store.health_verdict()
+    assert before.ready and before.verified_log_size == 1
+
+    entry = store.append(
+        key.sign_record(_body(name="skill-1")), created_at="2026-07-13T00:00:01Z"
+    )
+    after = store.health_verdict()
+    assert after.ready and after.error is None
+    assert after.verified_head == entry.entry_hash == store.head()[1]
+    assert after.verified_log_size == 2
+    # The incremental advance moves the head only; the staleness clock still
+    # requires a periodic full pass to catch interior tampering of old rows.
+    assert after.verified_at == before.verified_at
+
+
+def test_health_verifier_lifecycle_and_lifespan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "thread.db", health_verify_interval=3600.0)
+    try:
+        assert not store.health_verifier_running()
+        store.start_health_verifier()
+        assert store.health_verifier_running()
+        store.start_health_verifier()
+        assert store.health_verifier_running()
+        store.stop_health_verifier()
+        assert not store.health_verifier_running()
+        store.stop_health_verifier()
+        assert not store.health_verifier_running()
+    finally:
+        store.close()
+
+    # A short interval actually fires the background pass on a quiet store.
+    background = Store(tmp_path / "thread2.db", health_verify_interval=0.05)
+    try:
+        calls: list[int] = [0]
+        real_refresh = background.refresh_health_verdict
+
+        def counting() -> object:
+            calls[0] += 1
+            return real_refresh()
+
+        monkeypatch.setattr(background, "refresh_health_verdict", counting)
+        background.start_health_verifier()
+        try:
+            deadline = time.monotonic() + 10.0
+            while not calls and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert calls, "background verifier never fired"
+            assert background.health_verdict().ready
+        finally:
+            background.stop_health_verifier()
+    finally:
+        background.close()
+
+    # Serving lifespan starts the verifier on entry and stops it on exit.
+    served = Store(tmp_path / "life.db", health_verify_interval=3600.0)
+    try:
+        app = create_app(
+            store=served, signing_key=signing.generate_key(), tokens=AuditorTokens([])
+        )
+        with TestClient(app) as client:
+            assert served.health_verifier_running()
+            assert client.get("/health").status_code == 200
+        assert not served.health_verifier_running()
+    finally:
+        served.close()
+
+
+def test_health_refresh_detects_boundary_cache_tampering(tmp_path: Path) -> None:
+    path = tmp_path / "cache-tamper.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(3):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    assert store.refresh_health_verdict().ready
+
+    # Tamper only the memoized Merkle root: the O(1) live anchors check
+    # head/timestamp, so reads keep serving it — only the refresh catches it.
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE boundaries SET merkle_root = ? WHERE log_size = 3", ("ee" * 32,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert store.snapshot_boundary().merkle_root == "ee" * 32
+    verdict = store.refresh_health_verdict()
+    assert not verdict.ready
+    assert "boundary cache" in (verdict.error or "")
+
+
+def test_health_refresh_detects_frontier_tampering(tmp_path: Path) -> None:
+    path = tmp_path / "frontier-tamper.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(3):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    assert store.refresh_health_verdict().ready
+
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT tail FROM merkle_frontier WHERE level = 0"
+        ).fetchone()
+        assert row is not None
+        tail = json.loads(row[0])
+        tail[0] = "ff" * 32
+        connection.execute(
+            "UPDATE merkle_frontier SET tail = ? WHERE level = 0", (json.dumps(tail),)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    verdict = store.refresh_health_verdict()
+    assert not verdict.ready
+    assert "frontier" in (verdict.error or "")
+
+
+def test_boundary_cache_comparison_branches() -> None:
+    import csk_registry.store as store_module
+
+    leaves = [
+        (
+            hashlib.sha256(f"leaf-{index}".encode()).hexdigest(),
+            f"2026-07-13T00:00:0{index}Z",
+        )
+        for index in range(3)
+    ]
+    expected, frontier = store_module._recompute_prefix(leaves)
+    stored = {size: boundary for size, boundary in enumerate(expected, start=1)}
+
+    def _tails(levels: list[store_module._FrontierLevel]) -> list[store_module._FrontierLevel]:
+        return [
+            store_module._FrontierLevel(length=level.length, tail=list(level.tail))
+            for level in levels
+        ]
+
+    base = {
+        "expected": expected,
+        "stored": dict(stored),
+        "walked_size": 3,
+        "live_size": 3,
+        "frontier_length": 3,
+        "stored_frontier": _tails(frontier),
+        "recomputed_frontier": frontier,
+    }
+    assert store_module._boundary_cache_errors(**base) == []
+
+    missing = dict(base, stored={size: row for size, row in stored.items() if size != 2})
+    assert any(
+        "missing log size 2" in error
+        for error in store_module._boundary_cache_errors(**missing)
+    )
+
+    disagreed = dict(stored)
+    disagreed[3] = ("00" * 32, disagreed[3][1], disagreed[3][2])
+    assert any(
+        "disagrees with the committed log" in error
+        for error in store_module._boundary_cache_errors(**dict(base, stored=disagreed))
+    )
+
+    # A row committed after the chain statement started is a legitimate
+    # concurrent append: ignored, and the frontier tails are skipped while
+    # the (race-free) length check still holds.
+    concurrent = dict(
+        base,
+        expected=expected[:2],
+        walked_size=2,
+        stored_frontier=[],
+    )
+    assert store_module._boundary_cache_errors(**concurrent) == []
+
+    beyond = dict(stored)
+    beyond[4] = ("ab" * 32, "cd" * 32, "2026-07-13T00:00:03Z")
+    assert any(
+        "uncommitted log size 4" in error
+        for error in store_module._boundary_cache_errors(**dict(base, stored=beyond))
+    )
+
+    invalid = dict(stored)
+    invalid[0] = stored[1]
+    assert any(
+        "invalid log size 0" in error
+        for error in store_module._boundary_cache_errors(**dict(base, stored=invalid))
+    )
+
+    assert any(
+        "does not match the log head" in error
+        for error in store_module._boundary_cache_errors(**dict(base, frontier_length=2))
+    )
+
+    wrong_tails = [
+        store_module._FrontierLevel(length=level.length, tail=[b"\x00" * 32 for _ in level.tail])
+        for level in frontier
+    ]
+    assert any(
+        "frontier disagrees" in error
+        for error in store_module._boundary_cache_errors(
+            **dict(base, stored_frontier=wrong_tails)
+        )
+    )
+
+    empty_expected, empty_frontier = store_module._recompute_prefix([])
+    assert (
+        store_module._boundary_cache_errors(
+            expected=empty_expected,
+            stored={},
+            walked_size=0,
+            live_size=0,
+            frontier_length=None,
+            stored_frontier=[],
+            recomputed_frontier=empty_frontier,
+        )
+        == []
+    )
+
+
+def test_serve_health_verify_interval_flag_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from csk_registry import HEALTH_VERIFY_INTERVAL_ENV
+    from csk_registry.app import _positive_float_env
+
+    parser = build_parser()
+    assert parser.parse_args(["serve"]).health_verify_interval is None
+    assert (
+        parser.parse_args(["serve", "--health-verify-interval", "60"]).health_verify_interval
+        == 60.0
+    )
+    # Invalid values are rejected before the server boots.
+    assert main(["--home", str(tmp_path), "serve", "--health-verify-interval", "0"]) == 1
+    assert main(["--home", str(tmp_path), "serve", "--health-verify-interval", "-5"]) == 1
+    assert main(["--home", str(tmp_path), "serve", "--health-verify-interval", "nan"]) == 1
+
+    monkeypatch.delenv(HEALTH_VERIFY_INTERVAL_ENV, raising=False)
+    assert _positive_float_env(HEALTH_VERIFY_INTERVAL_ENV, 300.0) == 300.0
+    monkeypatch.setenv(HEALTH_VERIFY_INTERVAL_ENV, "45")
+    assert _positive_float_env(HEALTH_VERIFY_INTERVAL_ENV, 300.0) == 45.0
+    monkeypatch.setenv(HEALTH_VERIFY_INTERVAL_ENV, "bogus")
+    with pytest.raises(RuntimeError, match="positive number"):
+        _positive_float_env(HEALTH_VERIFY_INTERVAL_ENV, 300.0)
+    monkeypatch.setenv(HEALTH_VERIFY_INTERVAL_ENV, "inf")
+    with pytest.raises(RuntimeError, match="positive number"):
+        _positive_float_env(HEALTH_VERIFY_INTERVAL_ENV, 300.0)
+
+    with pytest.raises(ValueError, match="health_verify_interval"):
+        Store(tmp_path / "bad.db", health_verify_interval=0)
+
+
+def test_frontier_tampering_rebuilds_and_next_append_stays_correct(
+    tmp_path: Path,
+) -> None:
+    import csk_registry.store as store_module
+
+    path = tmp_path / "frontier.db"
+    store = Store(path)
+    key = signing.generate_key()
+    for index in range(4):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    store.close()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("UPDATE merkle_frontier SET tail = ?", (json.dumps(["ff" * 32]),))
+        connection.commit()
+    finally:
+        connection.close()
+    reopened = Store(path)
+    try:
+        reopened.append(
+            key.sign_record(_body(name="skill-4")),
+            created_at="2026-07-13T00:00:04Z",
+        )
+        entry_hashes = [
+            str(row["entry_hash"])
+            for row in reopened._conn.execute(  # type: ignore[attr-defined]
+                "SELECT entry_hash FROM log ORDER BY seq"
+            )
+        ]
+        assert reopened.snapshot_boundary().merkle_root == store_module._merkle_root(
+            entry_hashes
+        )
+    finally:
+        reopened.close()

@@ -29,5 +29,15 @@ cursor page is served only at the cursor's carried boundary, and a carried
 boundary that disagrees with the committed log or is no longer available is
 refused with `404 invalid_cursor` rather than re-evaluated at a newer boundary.
 
+Health is fail-closed too: `GET /health` serves a cached integrity verdict
+that a background full verifier refreshes on a bounded interval, and any
+failed pass (corruption found or the walk itself failing) latches non-ready
+and disables writes until a restart re-verifies — corruption found between
+restarts is never served as healthy once the next pass completes. A verifier
+that stops completing trips the staleness bound (twice the interval) into a
+non-ready state that is transient instead of latched: the next successful
+pass restores readiness automatically, while a failed pass still latches
+until restart.
+
 The complete normative threat model and deployment requirements are in the
 [Curator registry-service profile](https://github.com/relux-works/curator-spec/blob/main/profiles/registry-service.md).

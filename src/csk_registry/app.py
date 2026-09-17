@@ -5,10 +5,13 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -17,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import COMMAND_NAME, __version__, home_from_env
+from . import COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, __version__, home_from_env
 from .auth import AuditorTokens
 from .clock import utc_now
 from .keys import load_active_key, public_keys
@@ -39,6 +42,7 @@ from .signing import (
 )
 from .snapshot import build_snapshot
 from .store import (
+    DEFAULT_HEALTH_VERIFY_INTERVAL_SECONDS,
     CursorBoundaryMismatch,
     IdempotencyConflict,
     SnapshotBoundary,
@@ -89,7 +93,16 @@ def create_app(
 ) -> FastAPI:
     if max_concurrent_requests < 1:
         raise ValueError("max_concurrent_requests must be positive")
-    app = FastAPI(title="Curator Skill Registry", version=__version__)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        store.start_health_verifier()
+        try:
+            yield
+        finally:
+            store.stop_health_verifier()
+
+    app = FastAPI(title="Curator Skill Registry", version=__version__, lifespan=lifespan)
     accepted_signing_keys = tuple(dict.fromkeys((signing_key.public_pinned, *verification_keys)))
     concurrency = asyncio.Semaphore(max_concurrent_requests)
     network_limiter = FixedWindowLimiter(requests=network_requests_per_minute)
@@ -186,11 +199,10 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        try:
-            errors = store.integrity_errors()
-        except Exception as exc:
-            raise APIError(503, "not_ready", "registry durable state could not be verified") from exc
-        if errors:
+        # Cached verdict: no chain walk, no hashing, no I/O per probe. The
+        # background verifier refreshes it; a failed or stale verdict is
+        # non-ready, exactly like a startup §5 mismatch.
+        if not store.health_verdict().ready:
             raise APIError(503, "not_ready", "registry durable state failed integrity verification")
         return {"status": "ok"}
 
@@ -631,7 +643,12 @@ def app_from_env() -> FastAPI:
     if not key_path.exists():
         raise RuntimeError(f"signing key not found at {key_path}; run '{COMMAND_NAME} genkey' first")
     signing_key = load_active_key(home)
-    store = Store(home / "registry.db")
+    store = Store(
+        home / "registry.db",
+        health_verify_interval=_positive_float_env(
+            HEALTH_VERIFY_INTERVAL_ENV, DEFAULT_HEALTH_VERIFY_INTERVAL_SECONDS
+        ),
+    )
     tokens = AuditorTokens.from_file(home / "auditors.json")
     return create_app(
         store=store,
@@ -663,4 +680,17 @@ def _positive_env(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be a positive integer") from exc
     if value < 1:
         raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive number of seconds") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be a positive number of seconds")
     return value

@@ -4,12 +4,13 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import secrets
 import sys
 from pathlib import Path
 
-from . import COMMAND_NAME, HOME_ENV, home_from_env
+from . import COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, HOME_ENV, home_from_env
 from .auth import Auditor, AuditorTokens
 from .bundle import export_bundle, import_bundle
 from .clock import utc_now
@@ -28,7 +29,12 @@ from .permissions import protect_private_directory
 from .protocol import load_json, validate_record, validate_snapshot
 from .signing import verify_signed
 from .snapshot import build_snapshot
-from .store import SnapshotBoundary, Store, StoreIntegrityError
+from .store import (
+    DEFAULT_HEALTH_VERIFY_INTERVAL_SECONDS,
+    SnapshotBoundary,
+    Store,
+    StoreIntegrityError,
+)
 
 
 def _home(args: argparse.Namespace) -> Path:
@@ -331,11 +337,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if args.health_verify_interval is not None and (
+        not math.isfinite(args.health_verify_interval) or args.health_verify_interval <= 0
+    ):
+        print("serve requires --health-verify-interval to be a positive number of seconds", file=sys.stderr)
+        return 1
     import uvicorn
 
     from .app import app_from_env
 
     os.environ[HOME_ENV] = args.home
+    if args.health_verify_interval is not None:
+        os.environ[HEALTH_VERIFY_INTERVAL_ENV] = str(args.health_verify_interval)
     uvicorn.run(
         app_from_env(),
         host=args.host,
@@ -451,6 +464,18 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--trusted-proxy",
         help="comma-separated proxy IPs allowed to supply forwarded headers",
+    )
+    serve.add_argument(
+        "--health-verify-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "seconds between background full-integrity passes refreshing the "
+            "cached /health verdict "
+            f"(default: {DEFAULT_HEALTH_VERIFY_INTERVAL_SECONDS:g}; "
+            f"{HEALTH_VERIFY_INTERVAL_ENV} when the flag is absent)"
+        ),
     )
     serve.set_defaults(func=_cmd_serve)
 
