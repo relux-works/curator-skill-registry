@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -15,10 +16,11 @@ from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry
 from referencing.jsonschema import DRAFT202012
 
-from csk_registry import signing
-from csk_registry.app import _encode_cursor, create_app
+from csk_registry import CHECKPOINT_ENV, HOME_ENV, signing
+from csk_registry.app import _encode_cursor, app_from_env, create_app
 from csk_registry.auth import Auditor, AuditorTokens
 from csk_registry.bundle import import_bundle
+from csk_registry.keys import initialize_key, write_private_json
 from csk_registry.protocol import (
     ProtocolError,
     load_json,
@@ -741,6 +743,226 @@ def test_shared_service_snapshot_and_restore_vectors(tmp_path: Path) -> None:
         assert checkpoint.version == case["checkpoint_version"]
         assert (candidate_boundary.head == checkpoint.head) is case["matching_head"]
         assert candidate_store.checkpoint_matches(checkpoint) is case["ready"]
+
+
+def _checkpoint_record(key: signing.SigningKey, lineage: str, index: int) -> dict[str, Any]:
+    return key.sign_record(
+        {
+            "schema_version": 1,
+            "name": f"skill-{lineage}-{index}",
+            "source_identity": "git.example.com/skills/checkpoint",
+            "commit": f"{index:040d}",
+            "content_sha256": "sha256:" + f"{index:064x}",
+            "status": "audited",
+            "audit": {"lineage": lineage},
+        }
+    )
+
+
+def _append_checkpoint_record(store: Store, key: signing.SigningKey, lineage: str, index: int) -> None:
+    store.append(
+        _checkpoint_record(key, lineage, index),
+        created_at=f"2026-07-13T00:00:{index:02d}Z",
+    )
+
+
+def _run_startup_checkpoint_case(
+    workdir: Path,
+    case: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Drive one ``checkpoint_cases`` vector through the real startup path."""
+    name = case["name"]
+    live_version = case["live_version"]
+    checkpoint_version = case["checkpoint_version"]
+    home = workdir / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    registry_key = initialize_key(home)
+    auditor_key = signing.generate_key()
+    token = "startup-checkpoint-conformance-token"
+    write_private_json(
+        home / "auditors.json",
+        {
+            "auditors": [
+                {
+                    "auditor_id": "checkpoint-auditor",
+                    "org": "Conformance",
+                    "public_key": auditor_key.public_pinned,
+                    "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                }
+            ]
+        },
+    )
+    live = Store(home / "registry.db")
+    scratch = Store(workdir / "scratch.db")
+    checkpoint_snapshot: dict[str, Any] | None = None
+    if name == "checkpoint-below-live-consistent":
+        for index in range(checkpoint_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+        checkpoint_snapshot = build_snapshot(live, registry_key)
+        for index in range(checkpoint_version, live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+    elif name == "checkpoint-equal-consistent":
+        for index in range(live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+        checkpoint_snapshot = build_snapshot(live, registry_key)
+    elif name == "checkpoint-equal-inconsistent":
+        for index in range(live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+        for index in range(checkpoint_version):
+            _append_checkpoint_record(scratch, registry_key, "B", index)
+        checkpoint_snapshot = build_snapshot(scratch, registry_key)
+    elif name == "live-below-checkpoint":
+        for index in range(checkpoint_version):
+            _append_checkpoint_record(scratch, registry_key, "A", index)
+        checkpoint_snapshot = build_snapshot(scratch, registry_key)
+        for index in range(live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+    elif name == "live-above-prefix-mismatch":
+        for index in range(checkpoint_version):
+            _append_checkpoint_record(scratch, registry_key, "B", index)
+        checkpoint_snapshot = build_snapshot(scratch, registry_key)
+        for index in range(live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+    elif name == "checkpoint-signature-invalid":
+        for index in range(live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+        checkpoint_snapshot = build_snapshot(live, signing.generate_key())
+    elif name == "checkpoint-not-configured":
+        for index in range(live_version):
+            _append_checkpoint_record(live, registry_key, "A", index)
+    else:
+        raise AssertionError(f"unknown checkpoint case {name!r}")
+
+    # The constructed inputs reproduce the vector's discriminating predicates.
+    assert live.head()[0] == live_version
+    live_boundary = live.snapshot_boundary()
+    if checkpoint_snapshot is not None:
+        assert checkpoint_snapshot["version"] == checkpoint_version
+        assert checkpoint_snapshot["log_size"] == checkpoint_version
+        assert (
+            signing.verify_signed(registry_key.public_pinned, checkpoint_snapshot)
+            is case["signature_valid"]
+        )
+        if live_version == checkpoint_version:
+            same_body = (
+                live_boundary.head == checkpoint_snapshot["head"]
+                and live_boundary.merkle_root == checkpoint_snapshot["merkle_root"]
+                and live_boundary.log_size == checkpoint_snapshot["log_size"]
+            )
+            assert same_body is case["same_boundary_body"]
+        if live_version > checkpoint_version:
+            prefix = live.snapshot_boundary(checkpoint_version)
+            reproduced = (
+                prefix.head == checkpoint_snapshot["head"]
+                and prefix.merkle_root == checkpoint_snapshot["merkle_root"]
+            )
+            assert reproduced is case["prefix_reproduced"]
+
+    checkpoint_path = workdir / "checkpoint.json"
+    if case["checkpoint_configured"]:
+        assert checkpoint_snapshot is not None
+        checkpoint_path.write_text(json.dumps(checkpoint_snapshot), encoding="utf-8")
+    live.close()
+    scratch.close()
+
+    monkeypatch.setenv(HOME_ENV, str(home))
+    if case["checkpoint_configured"]:
+        monkeypatch.setenv(CHECKPOINT_ENV, str(checkpoint_path))
+    else:
+        monkeypatch.delenv(CHECKPOINT_ENV, raising=False)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+        app = app_from_env()
+    client = TestClient(app)
+
+    health = client.get("/health")
+    if case["ready"]:
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok"}
+    else:
+        assert health.status_code == 503
+        assert health.json()["error"]["code"] == case["diagnostic"]
+
+    # Writes follow readiness through the common integrity path.
+    submission = auditor_key.sign_record(
+        {
+            "schema_version": 1,
+            "name": "skill-submit-0",
+            "source_identity": "git.example.com/skills/checkpoint",
+            "commit": f"{99:040d}",
+            "content_sha256": "sha256:" + f"{99:064x}",
+            "status": "audited",
+            "audit": {},
+        }
+    )
+    posted = client.post(
+        "/v1/records", json=submission, headers={"Authorization": f"Bearer {token}"}
+    )
+    if case["ready"]:
+        assert posted.status_code == 201
+    else:
+        assert posted.status_code == 503
+        assert posted.json()["error"]["code"] == "storage_unavailable"
+
+    startup_events = []
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("event") == "startup_checkpoint":
+            startup_events.append(payload)
+    assert len(startup_events) == 1
+    event = startup_events[0]
+    if not case["checkpoint_configured"]:
+        assert event["configured"] is False
+        assert event["posture"] == case["posture"] == "checkpoint_not_configured"
+    else:
+        assert checkpoint_snapshot is not None
+        assert event["configured"] is True
+        assert event["checkpoint"]["version"] == checkpoint_version
+        assert event["checkpoint"]["log_size"] == checkpoint_version
+        assert event["checkpoint"]["head"] == checkpoint_snapshot["head"]
+        assert event["live"]["version"] == live_version
+        assert event["live"]["log_size"] == live_version
+        assert event["live"]["head"] == live_boundary.head
+        if case["ready"]:
+            assert event["result"] == "ok"
+            assert "diagnostic" not in event
+        else:
+            assert event["result"] == "refused"
+            assert event["diagnostic"] == case["diagnostic"]
+
+    if not case["ready"]:
+        # A refusal never truncates or repairs history: the store alone
+        # still verifies and reports ready without the checkpoint.
+        reopened = Store(home / "registry.db")
+        try:
+            assert reopened.head()[0] == live_version
+            assert reopened.health_verdict().ready
+        finally:
+            reopened.close()
+
+
+def test_shared_service_startup_checkpoint_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cases = _json("vectors/registry-service.json")["checkpoint_cases"]
+    assert {case["name"] for case in cases} == {
+        "checkpoint-below-live-consistent",
+        "checkpoint-equal-consistent",
+        "checkpoint-equal-inconsistent",
+        "live-below-checkpoint",
+        "live-above-prefix-mismatch",
+        "checkpoint-signature-invalid",
+        "checkpoint-not-configured",
+    }
+    for case in cases:
+        _run_startup_checkpoint_case(tmp_path / case["name"], case, monkeypatch, caplog)
 
 
 def _service_http_client(

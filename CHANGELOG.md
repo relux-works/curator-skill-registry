@@ -33,6 +33,26 @@
 
 ### Security
 
+- R3/P2: `serve --checkpoint <signed snapshot>`
+  (`CURATOR_SKILL_REGISTRY_CHECKPOINT`) compares the live boundary against
+  the operator checkpoint at startup, after the §5 integrity verification
+  and before the listener binds or `/health` can report ready. The
+  checkpoint signature is verified first against the accepted
+  (staged-rotation) keys; a live version below the checkpoint refuses with
+  `restore_below_checkpoint`, an equal version with a different `head`,
+  `merkle_root`, or `log_size` — or a live state above the checkpoint whose
+  log does not reproduce the checkpoint boundary at its `log_size` — refuses
+  with `restore_inconsistent_with_checkpoint`, and a bad signature refuses
+  with `checkpoint_signature_invalid`. A refusal stays up non-ready
+  (`/health` 503 carrying the diagnostic code, writes 503) without
+  truncating or repairing history; without a checkpoint the
+  `startup_checkpoint` audit event (stderr, structured) records
+  `checkpoint_not_configured`, otherwise the compared checkpoint/live
+  boundaries (`version`, `log_size`, `head`) and the outcome. `verify-backup`
+  stays as the offline vetting
+  procedure; the startup comparison is the normative readiness gate. The
+  `health-response-v1` success envelope is unchanged (curator-spec
+  `47c3c8c`).
 - R2: snapshot-boundary lookups no longer rescan the log or rebuild the
   Merkle tree per request. Each append now memoizes its boundary tuple
   `(log_size, head, merkle_root, created_at)` in a durable `boundaries`

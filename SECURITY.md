@@ -20,14 +20,20 @@ publish corrective records through an unaffected auditor. History is not
 rewritten. An auditor compromise disables that auditor credential and uses a
 different authorized auditor for corrective records.
 
-Restore is fail-closed: `verify-backup` validates the full store and requires a
-signed external high-water checkpoint before the database can serve the same
-canonical URL. Keep checkpoints and secret backups outside the primary store,
-encrypted and access controlled. Cursor and response data never bootstrap
-trust; clients pin registry keys out of band. Pagination is fail-closed too: a
-cursor page is served only at the cursor's carried boundary, and a carried
-boundary that disagrees with the committed log or is no longer available is
-refused with `404 invalid_cursor` rather than re-evaluated at a newer boundary.
+Restore is fail-closed: `serve --checkpoint` (or
+`CURATOR_SKILL_REGISTRY_CHECKPOINT`) compares live state against the signed
+external high-water checkpoint after integrity verification and before the
+service becomes ready, and a live state below or inconsistent with it stays
+up non-ready with writes disabled instead of serving stale state. This
+startup comparison is the normative "before the service becomes ready" gate;
+`verify-backup` stays as the offline operator procedure for vetting a
+candidate backup before a restore. Keep checkpoints and secret backups
+outside the primary store, encrypted and access controlled. Cursor and
+response data never bootstrap trust; clients pin registry keys out of band.
+Pagination is fail-closed too: a cursor page is served only at the cursor's
+carried boundary, and a carried boundary that disagrees with the committed
+log or is no longer available is refused with `404 invalid_cursor` rather
+than re-evaluated at a newer boundary.
 
 Health is fail-closed too: `GET /health` serves a cached integrity verdict
 that a background full verifier refreshes on a bounded interval, and any

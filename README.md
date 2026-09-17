@@ -97,6 +97,43 @@ older or equivocal database is refused. Stop all writers before replacing the
 live database. Signing keys and `auditors.json` are backed up separately using
 encrypted, access-controlled secret storage.
 
+### Startup checkpoint gate
+
+`verify-backup` is the offline procedure for vetting a backup before a
+restore. The normative enforcement of "before the service becomes ready" is
+the startup checkpoint comparison: pass the operator checkpoint to `serve`
+and the service compares live state against it after integrity verification
+and before the listener binds or `/health` can report ready.
+
+```bash
+curator-skill-registry --home ./data serve --checkpoint /secure-high-water/registry-snapshot.json
+# or: CURATOR_SKILL_REGISTRY_CHECKPOINT=/secure-high-water/registry-snapshot.json
+```
+
+The file is a signed `registry-snapshot-v1` object, verified against the
+accepted signing keys (the staged-rotation set). Produce it with
+`backup --checkpoint-out` alongside a consistent database backup, or with
+`export-snapshot` for the live boundary; keep it outside the primary store,
+encrypted and access controlled. To rotate it, write the new checkpoint and
+restart `serve` against it — the comparison runs once at startup. Re-issue
+the checkpoint (re-export the live boundary) before retiring an old signing
+key, otherwise a checkpoint signed by the retired key refuses with
+`checkpoint_signature_invalid`.
+
+A live version below the checkpoint refuses with
+`restore_below_checkpoint`; an equal version with a different `head`,
+`merkle_root`, or `log_size`, or a live state above the checkpoint whose log
+does not reproduce the checkpoint boundary at its `log_size`, refuses with
+`restore_inconsistent_with_checkpoint`. A refusal stays up non-ready:
+`/health` reports `503` with the diagnostic code, writes report `503`, and
+history is never truncated or repaired — recover the missing verified suffix
+or remain unavailable. Without `--checkpoint` the service starts as before
+and records `checkpoint_not_configured` in the `startup_checkpoint` audit
+event; with one, that event carries the compared checkpoint/live boundaries
+(`version`, `log_size`, `head`) and the outcome. The event is emitted to
+stderr as structured JSON (refusals at WARNING, posture and success at INFO)
+before the server configures logging, so it is visible in production output.
+
 ### Signing-key rotation
 
 Rotation is staged so clients never see an unannounced signer and live cursors
@@ -211,8 +248,9 @@ mypy
 
 CI checks out the authoritative specification suite and verifies CCJ-1 bytes,
 signed objects, stable pagination, concurrent append, scoped idempotency,
-recovery, restore checkpoints, key rotation, resource controls, chain/Merkle
-commitments, and authenticated bundle imports on Linux, macOS, and Windows.
+recovery, restore checkpoints, the startup checkpoint comparison, key
+rotation, resource controls, chain/Merkle commitments, and authenticated
+bundle imports on Linux, macOS, and Windows.
 
 See [SECURITY.md](SECURITY.md) for private reporting and incident boundaries,
 and [CHANGELOG.md](CHANGELOG.md) for behavior and compatibility changes.

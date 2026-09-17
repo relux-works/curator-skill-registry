@@ -10,7 +10,7 @@ import secrets
 import sys
 from pathlib import Path
 
-from . import COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, HOME_ENV, home_from_env
+from . import CHECKPOINT_ENV, COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, HOME_ENV, home_from_env
 from .auth import Auditor, AuditorTokens
 from .bundle import export_bundle, import_bundle
 from .clock import utc_now
@@ -344,11 +344,17 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         return 1
     import uvicorn
 
-    from .app import app_from_env
+    from .app import app_from_env, ensure_startup_audit_sink
 
     os.environ[HOME_ENV] = args.home
     if args.health_verify_interval is not None:
         os.environ[HEALTH_VERIFY_INTERVAL_ENV] = str(args.health_verify_interval)
+    if args.checkpoint is not None:
+        os.environ[CHECKPOINT_ENV] = args.checkpoint
+    # The §6 comparison runs inside app_from_env(), before Uvicorn configures
+    # logging; attach the structured audit sink first so the posture and
+    # outcome events are recorded in production.
+    ensure_startup_audit_sink()
     uvicorn.run(
         app_from_env(),
         host=args.host,
@@ -475,6 +481,19 @@ def build_parser() -> argparse.ArgumentParser:
             "cached /health verdict "
             f"(default: {DEFAULT_HEALTH_VERIFY_INTERVAL_SECONDS:g}; "
             f"{HEALTH_VERIFY_INTERVAL_ENV} when the flag is absent)"
+        ),
+    )
+    serve.add_argument(
+        "--checkpoint",
+        default=None,
+        metavar="PATH",
+        help=(
+            "signed registry-snapshot-v1 checkpoint compared against live "
+            "state at startup, after integrity verification and before the "
+            "listener binds or /health reports ready; a live state below or "
+            "inconsistent with it stays up non-ready with writes disabled "
+            f"({CHECKPOINT_ENV} when the flag is absent; without a checkpoint "
+            "the service records checkpoint_not_configured)"
         ),
     )
     serve.set_defaults(func=_cmd_serve)

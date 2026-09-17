@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, NoReturn
 
+from .checkpoint import REFUSAL_DIAGNOSTICS, CheckpointView, compare_checkpoint
 from .permissions import protect_private_file
 from .signing import canonical_bytes
 
@@ -152,6 +153,9 @@ class HealthVerdict:
     the background full verifier, and advanced incrementally by appends. It
     performs no hashing or I/O to read: ``ready`` is a pure function of the
     stored fields plus the staleness bound evaluated at read time.
+    ``code`` is the ``503`` error code served while non-ready: ``not_ready``
+    for integrity failures, or the §6 refusal diagnostic when a startup
+    checkpoint comparison refused.
     """
 
     ready: bool
@@ -159,6 +163,7 @@ class HealthVerdict:
     verified_log_size: int
     verified_at: str
     error: str | None
+    code: str = "not_ready"
 
 
 @dataclass(frozen=True)
@@ -199,6 +204,7 @@ class Store:
         self._health_verified_log_size = 0
         self._health_verified_at = ""
         self._health_error: str | None = "startup verification has not completed"
+        self._health_code = "not_ready"
         self._health_last_refresh_monotonic = time.monotonic()
         self._integrity_failed = False
         self._verifier_lock = threading.Lock()
@@ -1364,6 +1370,7 @@ class Store:
                     verified_log_size=self._health_verified_log_size,
                     verified_at=self._health_verified_at,
                     error=self._health_error,
+                    code=self._health_code,
                 )
             if self._health_stale_locked(now):
                 return HealthVerdict(
@@ -1471,6 +1478,7 @@ class Store:
                     verified_log_size=self._health_verified_log_size,
                     verified_at=self._health_verified_at,
                     error=self._health_error,
+                    code=self._health_code,
                 )
                 self._log_health_refresh(
                     result="integrity_failed_latched",
@@ -1514,6 +1522,7 @@ class Store:
                     verified_log_size=self._health_verified_log_size,
                     verified_at=self._health_verified_at,
                     error=self._health_error,
+                    code=self._health_code,
                 )
             boundary: SnapshotBoundary | None = None
             if not errors:
@@ -1544,6 +1553,7 @@ class Store:
                     verified_log_size=self._health_verified_log_size,
                     verified_at=self._health_verified_at,
                     error=self._health_error,
+                    code=self._health_code,
                 )
             # The walked prefix is verified and every newer append passed its
             # incremental check, so the live head is verified transitively.
@@ -1659,6 +1669,50 @@ class Store:
         except (ValueError, StoreIntegrityError):
             return False
         return prefix == checkpoint
+
+    def refuse_startup_checkpoint(self, diagnostic: str, detail: str) -> None:
+        """Latch a §6 startup-checkpoint refusal without comparison.
+
+        Used when the checkpoint itself is unusable (its signature fails
+        against the accepted keys): the service stays up non-ready with
+        writes disabled through the common integrity-failure path, exactly
+        like a failed comparison. Only the closed §6 refusal diagnostics
+        are accepted; only a restart clears the latch. History is untouched.
+        """
+        if diagnostic not in REFUSAL_DIAGNOSTICS:
+            raise ValueError(f"unknown startup-checkpoint diagnostic: {diagnostic}")
+        with self._lock:
+            if not self._integrity_failed:
+                self._health_code = diagnostic
+            self._latch_integrity_failure_locked(detail)
+
+    def apply_startup_checkpoint(self, checkpoint: CheckpointView) -> str | None:
+        """Compare the verified live boundary against a §6 startup checkpoint.
+
+        Runs once at startup, after the §5 verification and before the
+        service reports ready. Returns ``None`` when the comparison passes.
+        On refusal, latches non-ready plus writes-disabled through the
+        common integrity-failure path (``/health`` 503 with the refusal
+        diagnostic, writes 503) and returns that diagnostic. Only a restart
+        clears it; history is never truncated or repaired.
+        """
+        with self._lock, self._operation_deadline():
+            live = self._snapshot_boundary_locked(None)
+            prefix: SnapshotBoundary | None = None
+            if live.version > checkpoint.version:
+                try:
+                    prefix = self._snapshot_boundary_locked(checkpoint.log_size)
+                except (ValueError, StoreIntegrityError):
+                    prefix = None
+            diagnostic = compare_checkpoint(live, checkpoint, prefix)
+            if diagnostic is None:
+                return None
+            self.refuse_startup_checkpoint(
+                diagnostic,
+                f"startup checkpoint comparison refused: {diagnostic} "
+                f"(live version {live.version}, checkpoint version {checkpoint.version})",
+            )
+            return diagnostic
 
     def backup_to(self, destination: Path) -> SnapshotBoundary:
         destination.parent.mkdir(parents=True, exist_ok=True)

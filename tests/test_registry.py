@@ -5,17 +5,21 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from csk_registry import (
+    CHECKPOINT_ENV,
     COMMAND_NAME,
     HOME_ENV,
     LEGACY_COMMAND_NAME,
@@ -23,10 +27,11 @@ from csk_registry import (
     home_from_env,
     signing,
 )
-from csk_registry.app import _encode_cursor, create_app
+from csk_registry.app import _encode_cursor, app_from_env, create_app
 from csk_registry.auth import Auditor, AuditorTokens
+from csk_registry.checkpoint import CheckpointView, compare_checkpoint
 from csk_registry.cli import build_parser, main
-from csk_registry.keys import load_active_key, public_keys
+from csk_registry.keys import initialize_key, load_active_key, public_keys, write_private_json
 from csk_registry.permissions import (
     private_directory_permissions_enforced,
     private_file_permissions_enforced,
@@ -664,6 +669,557 @@ def test_backup_cli_emits_and_verifies_signed_checkpoint(tmp_path: Path):
             str(newer_checkpoint),
         ]
     ) == 2
+
+
+def _startup_home(home: Path, *, records: int) -> tuple[signing.SigningKey, str]:
+    """Create a serve-ready home with a key, one auditor, and a live log."""
+    home.mkdir(parents=True, exist_ok=True)
+    key = initialize_key(home)
+    auditor_key = signing.generate_key()
+    token = "startup-checkpoint-unit-test-token"
+    write_private_json(
+        home / "auditors.json",
+        {
+            "auditors": [
+                {
+                    "auditor_id": "a1",
+                    "org": "Example",
+                    "public_key": auditor_key.public_pinned,
+                    "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                }
+            ]
+        },
+    )
+    store = Store(home / "registry.db")
+    for index in range(records):
+        store.append(
+            key.sign_record(
+                _body(
+                    "audited",
+                    name=f"skill-checkpoint-{index}",
+                    commit=f"{index:040d}",
+                    content_sha256="sha256:" + f"{index:064x}",
+                )
+            ),
+            created_at=f"2026-07-13T00:00:{index:02d}Z",
+        )
+    store.close()
+    return auditor_key, token
+
+
+def test_serve_checkpoint_flag_sets_env_and_defers_to_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    assert build_parser().parse_args(["serve"]).checkpoint is None
+    assert (
+        build_parser()
+        .parse_args(["serve", "--checkpoint", "/secure/checkpoint.json"])
+        .checkpoint
+        == "/secure/checkpoint.json"
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_run(app: object, **kwargs: object) -> None:
+        seen["app"] = app
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    monkeypatch.setattr("csk_registry.app.app_from_env", lambda: "app-sentinel")
+    home = tmp_path / "home"
+    old_home = os.environ.get(HOME_ENV)
+    old_checkpoint = os.environ.get(CHECKPOINT_ENV)
+    try:
+        # The flag wins over the environment.
+        monkeypatch.setenv(CHECKPOINT_ENV, "/from/env.json")
+        assert (
+            main(["--home", str(home), "serve", "--checkpoint", "/from/flag.json"]) == 0
+        )
+        assert os.environ[HOME_ENV] == str(home)
+        assert os.environ[CHECKPOINT_ENV] == "/from/flag.json"
+        assert seen["app"] == "app-sentinel"
+        # Without the flag the environment value passes through untouched.
+        monkeypatch.setenv(CHECKPOINT_ENV, "/from/env.json")
+        assert main(["--home", str(home), "serve"]) == 0
+        assert os.environ[CHECKPOINT_ENV] == "/from/env.json"
+    finally:
+        if old_home is None:
+            os.environ.pop(HOME_ENV, None)
+        else:
+            os.environ[HOME_ENV] = old_home
+        if old_checkpoint is None:
+            os.environ.pop(CHECKPOINT_ENV, None)
+        else:
+            os.environ[CHECKPOINT_ENV] = old_checkpoint
+
+
+_SERVE_SUBPROCESS_TIMEOUT_SECONDS = 10.0
+
+
+def _serve_console_command(home: Path, extra: list[str]) -> list[str]:
+    """Resolve the real console entry point for a serve subprocess probe."""
+    script = shutil.which(COMMAND_NAME)
+    if script is None:
+        # Editable installs always provide the script; fall back to the
+        # module entry through this interpreter if PATH lacks it.
+        return [
+            sys.executable,
+            "-c",
+            "import sys; from csk_registry.cli import main; sys.exit(main(sys.argv[1:]))",
+            "--home",
+            str(home),
+            "serve",
+            "--port",
+            "0",
+            *extra,
+        ]
+    return [script, "--home", str(home), "serve", "--port", "0", *extra]
+
+
+def _run_serve_until_terminated(home: Path, extra: list[str], env: dict[str, str]) -> str:
+    """Run the real console entry in a fresh process; capture startup output.
+
+    The server is expected to stay up on an ephemeral port; the probe
+    terminates it once the startup output is produced and returns the combined
+    output. Fails loudly when the process exits early instead of serving.
+    """
+    child_env = dict(env)
+    src_dir = str(Path(__file__).parents[1] / "src")
+    child_env["PYTHONPATH"] = (
+        src_dir + os.pathsep + child_env["PYTHONPATH"]
+        if child_env.get("PYTHONPATH")
+        else src_dir
+    )
+    proc = subprocess.Popen(
+        _serve_console_command(home, extra),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=child_env,
+    )
+    try:
+        output, _ = proc.communicate(timeout=_SERVE_SUBPROCESS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            output, _ = proc.communicate(timeout=_SERVE_SUBPROCESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            output, _ = proc.communicate()
+    else:
+        raise AssertionError(f"serve exited early (code {proc.returncode}):\n{output}")
+    return output
+
+
+def _startup_checkpoint_events(output: str) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for line in output.splitlines():
+        if "startup_checkpoint" not in line:
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("event") == "startup_checkpoint":
+            events.append(payload)
+    return events
+
+
+def test_serve_subprocess_records_no_checkpoint_posture_on_stderr(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _startup_home(home, records=2)
+    env = dict(os.environ)
+    env.pop(CHECKPOINT_ENV, None)
+    output = _run_serve_until_terminated(home, [], env)
+    assert "Application startup complete." in output
+    events = _startup_checkpoint_events(output)
+    assert len(events) == 1
+    assert events[0]["configured"] is False
+    assert events[0]["posture"] == "checkpoint_not_configured"
+
+
+def test_serve_subprocess_records_successful_comparison_on_stderr(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _startup_home(home, records=3)
+    key = load_active_key(home)
+    store = Store(home / "registry.db")
+    checkpoint_snapshot = build_snapshot(store, key)
+    store.close()
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.write_text(json.dumps(checkpoint_snapshot), encoding="utf-8")
+    env = dict(os.environ)
+    env.pop(CHECKPOINT_ENV, None)
+    output = _run_serve_until_terminated(home, ["--checkpoint", str(checkpoint_path)], env)
+    assert "Application startup complete." in output
+    events = _startup_checkpoint_events(output)
+    assert len(events) == 1
+    assert events[0]["configured"] is True
+    assert events[0]["result"] == "ok"
+    assert events[0]["checkpoint"] == {
+        "version": 3,
+        "log_size": 3,
+        "head": checkpoint_snapshot["head"],
+    }
+    assert events[0]["live"] == {
+        "version": 3,
+        "log_size": 3,
+        "head": checkpoint_snapshot["head"],
+    }
+
+
+def test_serve_refuses_restored_older_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    home = tmp_path / "home"
+    auditor_key, token = _startup_home(home, records=7)
+    key = load_active_key(home)
+    store = Store(home / "registry.db")
+    older_backup = tmp_path / "older.db"
+    store.backup_to(older_backup)
+    for index in range(7, 10):
+        store.append(
+            key.sign_record(
+                _body(
+                    "audited",
+                    name=f"skill-checkpoint-{index}",
+                    commit=f"{index:040d}",
+                    content_sha256="sha256:" + f"{index:064x}",
+                )
+            ),
+            created_at=f"2026-07-13T00:00:{index:02d}Z",
+        )
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_snapshot = build_snapshot(store, key)
+    checkpoint_path.write_text(json.dumps(checkpoint_snapshot), encoding="utf-8")
+    store.close()
+    probe = Store(older_backup)
+    older_boundary = probe.snapshot_boundary()
+    probe.close()
+    # Silently restore the older database over the live one.
+    (home / "registry.db").write_bytes(older_backup.read_bytes())
+    for sidecar in ("-wal", "-shm"):
+        (home / f"registry.db{sidecar}").unlink(missing_ok=True)
+
+    monkeypatch.setenv(HOME_ENV, str(home))
+    monkeypatch.setenv(CHECKPOINT_ENV, str(checkpoint_path))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+        client = TestClient(app_from_env())
+
+    refused = client.get("/health")
+    assert refused.status_code == 503
+    assert refused.json()["error"]["code"] == "restore_below_checkpoint"
+    write = client.post(
+        "/v1/records",
+        json=auditor_key.sign_record(_body("audited", name="skill-late-write")),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert write.status_code == 503
+    assert write.json()["error"]["code"] == "storage_unavailable"
+    # Reads still serve, exactly like a §5 latch: only readiness and writes refuse.
+    assert client.get("/v1/snapshot").status_code == 200
+
+    events = []
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("event") == "startup_checkpoint":
+            events.append(payload)
+    assert len(events) == 1
+    assert events[0]["result"] == "refused"
+    assert events[0]["diagnostic"] == "restore_below_checkpoint"
+    assert events[0]["checkpoint"] == {
+        "version": 10,
+        "log_size": 10,
+        "head": checkpoint_snapshot["head"],
+    }
+    assert events[0]["live"] == {
+        "version": 7,
+        "log_size": 7,
+        "head": older_boundary.head,
+    }
+
+    # The refusal repaired nothing: the restored database is byte-identical.
+    assert (home / "registry.db").read_bytes() == older_backup.read_bytes()
+    reopened = Store(home / "registry.db")
+    try:
+        assert reopened.head()[0] == 7
+        assert reopened.health_verdict().ready
+    finally:
+        reopened.close()
+
+
+def test_serve_cli_entry_refuses_restored_older_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    auditor_key, token = _startup_home(home, records=7)
+    key = load_active_key(home)
+    store = Store(home / "registry.db")
+    older_backup = tmp_path / "older.db"
+    store.backup_to(older_backup)
+    for index in range(7, 10):
+        store.append(
+            key.sign_record(
+                _body(
+                    "audited",
+                    name=f"skill-checkpoint-{index}",
+                    commit=f"{index:040d}",
+                    content_sha256="sha256:" + f"{index:064x}",
+                )
+            ),
+            created_at=f"2026-07-13T00:00:{index:02d}Z",
+        )
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(build_snapshot(store, key)), encoding="utf-8"
+    )
+    store.close()
+    # Silently restore the older database over the live one.
+    (home / "registry.db").write_bytes(older_backup.read_bytes())
+    for sidecar in ("-wal", "-shm"):
+        (home / f"registry.db{sidecar}").unlink(missing_ok=True)
+
+    # Drive the real CLI entry with the factory and enforcement real; only
+    # Uvicorn's final run boundary is intercepted to inspect the app.
+    captured: dict[str, object] = {}
+
+    def fake_run(app: object, **kwargs: object) -> None:
+        captured["app"] = app
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    old_home = os.environ.get(HOME_ENV)
+    old_checkpoint = os.environ.get(CHECKPOINT_ENV)
+    os.environ.pop(CHECKPOINT_ENV, None)
+    try:
+        assert (
+            main(["--home", str(home), "serve", "--checkpoint", str(checkpoint_path)])
+            == 0
+        )
+        assert os.environ[HOME_ENV] == str(home)
+        assert os.environ[CHECKPOINT_ENV] == str(checkpoint_path)
+        app = captured["app"]
+        assert isinstance(app, FastAPI)
+        client = TestClient(app)
+        refused = client.get("/health")
+        assert refused.status_code == 503
+        assert refused.json()["error"]["code"] == "restore_below_checkpoint"
+        write = client.post(
+            "/v1/records",
+            json=auditor_key.sign_record(_body("audited", name="skill-late-write")),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert write.status_code == 503
+        assert write.json()["error"]["code"] == "storage_unavailable"
+        assert client.get("/v1/snapshot").status_code == 200
+        assert (home / "registry.db").read_bytes() == older_backup.read_bytes()
+        reopened = Store(home / "registry.db")
+        try:
+            assert reopened.head()[0] == 7
+            assert reopened.health_verdict().ready
+        finally:
+            reopened.close()
+    finally:
+        if old_home is None:
+            os.environ.pop(HOME_ENV, None)
+        else:
+            os.environ[HOME_ENV] = old_home
+        if old_checkpoint is None:
+            os.environ.pop(CHECKPOINT_ENV, None)
+        else:
+            os.environ[CHECKPOINT_ENV] = old_checkpoint
+
+
+def test_startup_checkpoint_unreadable_or_malformed_fails_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    _startup_home(home, records=1)
+    monkeypatch.setenv(HOME_ENV, str(home))
+    monkeypatch.setenv(CHECKPOINT_ENV, str(home / "missing.json"))
+    with pytest.raises(RuntimeError, match="startup checkpoint is unreadable"):
+        app_from_env()
+    (home / "bad.json").write_text("not json{", encoding="utf-8")
+    monkeypatch.setenv(CHECKPOINT_ENV, str(home / "bad.json"))
+    with pytest.raises(RuntimeError, match="not a signed registry-snapshot-v1 object"):
+        app_from_env()
+    (home / "shape.json").write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    monkeypatch.setenv(CHECKPOINT_ENV, str(home / "shape.json"))
+    with pytest.raises(RuntimeError, match="not a signed registry-snapshot-v1 object"):
+        app_from_env()
+
+
+def test_compare_checkpoint_closed_diagnostics() -> None:
+    live = SnapshotBoundary(
+        version=8,
+        log_size=8,
+        head="a" * 64,
+        merkle_root="b" * 64,
+        created_at="2026-07-13T00:00:07Z",
+    )
+    same = CheckpointView(
+        version=8,
+        log_size=8,
+        head="a" * 64,
+        merkle_root="b" * 64,
+        created_at="2026-07-13T00:00:07Z",
+    )
+    assert compare_checkpoint(live, same, live) is None
+    above = SnapshotBoundary(
+        version=10,
+        log_size=10,
+        head="c" * 64,
+        merkle_root="d" * 64,
+        created_at="2026-07-13T00:00:09Z",
+    )
+    assert compare_checkpoint(above, same, live) is None
+    assert (
+        compare_checkpoint(
+            live,
+            CheckpointView(
+                version=9,
+                log_size=9,
+                head="f" * 64,
+                merkle_root="f" * 64,
+                created_at="2026-07-13T00:00:08Z",
+            ),
+            None,
+        )
+        == "restore_below_checkpoint"
+    )
+    for field, value in (
+        ("head", "0" * 64),
+        ("merkle_root", "0" * 64),
+        ("log_size", 7),
+    ):
+        mutated = CheckpointView(
+            version=same.version,
+            log_size=same.log_size if field != "log_size" else int(value),
+            head=same.head if field != "head" else str(value),
+            merkle_root=same.merkle_root if field != "merkle_root" else str(value),
+            created_at=same.created_at,
+        )
+        assert (
+            compare_checkpoint(live, mutated, live)
+            == "restore_inconsistent_with_checkpoint"
+        )
+    assert (
+        compare_checkpoint(above, same, None) == "restore_inconsistent_with_checkpoint"
+    )
+    diverged = SnapshotBoundary(
+        version=8,
+        log_size=8,
+        head="e" * 64,
+        merkle_root="b" * 64,
+        created_at="2026-07-13T00:00:07Z",
+    )
+    assert (
+        compare_checkpoint(above, same, diverged)
+        == "restore_inconsistent_with_checkpoint"
+    )
+    root_diverged = SnapshotBoundary(
+        version=8,
+        log_size=8,
+        head="a" * 64,
+        merkle_root="0" * 64,
+        created_at="2026-07-13T00:00:07Z",
+    )
+    assert (
+        compare_checkpoint(above, same, root_diverged)
+        == "restore_inconsistent_with_checkpoint"
+    )
+
+
+def test_startup_checkpoint_above_with_root_only_mismatch_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    auditor_key, token = _startup_home(home, records=10)
+    key = load_active_key(home)
+    store = Store(home / "registry.db")
+    prefix = store.snapshot_boundary(8)
+    tampered_root = "0" * 64 if prefix.merkle_root != "0" * 64 else "f" * 64
+    checkpoint_snapshot = key.sign_record(
+        {
+            "schema_version": 1,
+            "version": 8,
+            "log_size": 8,
+            "head": prefix.head,
+            "merkle_root": tampered_root,
+            "created_at": prefix.created_at,
+        }
+    )
+    assert signing.verify_signed(key.public_pinned, checkpoint_snapshot)
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.write_text(json.dumps(checkpoint_snapshot), encoding="utf-8")
+    store.close()
+    monkeypatch.setenv(HOME_ENV, str(home))
+    monkeypatch.setenv(CHECKPOINT_ENV, str(checkpoint_path))
+    client = TestClient(app_from_env())
+    refused = client.get("/health")
+    assert refused.status_code == 503
+    assert refused.json()["error"]["code"] == "restore_inconsistent_with_checkpoint"
+    write = client.post(
+        "/v1/records",
+        json=auditor_key.sign_record(_body("audited", name="skill-late-write")),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert write.status_code == 503
+    assert write.json()["error"]["code"] == "storage_unavailable"
+    reopened = Store(home / "registry.db")
+    try:
+        assert reopened.head()[0] == 10
+        assert reopened.health_verdict().ready
+    finally:
+        reopened.close()
+
+
+def test_checkpoint_refusal_latches_and_survives_verifier(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _startup_home(home, records=2)
+    store = Store(home / "registry.db")
+    ahead = CheckpointView(
+        version=5,
+        log_size=5,
+        head="f" * 64,
+        merkle_root="f" * 64,
+        created_at="2026-07-13T00:00:04Z",
+    )
+    assert store.apply_startup_checkpoint(ahead) == "restore_below_checkpoint"
+    verdict = store.health_verdict()
+    assert not verdict.ready
+    assert verdict.code == "restore_below_checkpoint"
+    with pytest.raises(StoreIntegrityError):
+        store.append(
+            load_active_key(home).sign_record(_body()),
+            created_at="2026-07-13T00:00:02Z",
+        )
+    refreshed = store.refresh_health_verdict()
+    assert not refreshed.ready
+    assert refreshed.code == "restore_below_checkpoint"
+    store.close()
+
+    passing = Store(tmp_path / "passing.db")
+    boundary = passing.snapshot_boundary()
+    assert (
+        passing.apply_startup_checkpoint(
+            CheckpointView(
+                version=boundary.version,
+                log_size=boundary.log_size,
+                head=boundary.head,
+                merkle_root=boundary.merkle_root,
+                created_at=boundary.created_at,
+            )
+        )
+        is None
+    )
+    assert passing.health_verdict().ready
+    with pytest.raises(ValueError, match="unknown startup-checkpoint diagnostic"):
+        passing.refuse_startup_checkpoint("bogus_code", "detail")
+    passing.close()
 
 
 def test_staged_key_rotation_preserves_snapshot_body_and_live_cursors(tmp_path: Path):
@@ -1689,6 +2245,18 @@ def test_health_corruption_detected_at_next_refresh_disables_writes(
     assert refresh_events[0]["error"]
 
 
+#: Fixed manual-clock epoch for the exact-boundary staleness test. Anchoring
+#: the manual clock to the raw ``time.monotonic()`` value is host-dependent:
+#: when ``base + 20.0`` crosses a binary binade boundary (host uptime within
+#: 20 s below a power of two) the sum can round up by ~1 ulp, so the
+#: exact-bound step reads stale and the test flakes lane-dependently. Both
+#: exact-bound additions from this epoch (``+ 20.0`` twice, 40 s apart) stay
+#: inside the ``[8192, 16384)`` binade, where a sum of exactly representable
+#: addends is exact and the age subtraction is exact by Sterbenz — the
+#: boundary reads exactly ``20.0`` on every host.
+_MANUAL_CLOCK_EPOCH = 10000.0
+
+
 class _ManualStoreClock:
     """Injectable ``time`` replacement for deterministic staleness tests."""
 
@@ -1697,6 +2265,17 @@ class _ManualStoreClock:
 
     def monotonic(self) -> float:
         return self.now
+
+
+def test_manual_clock_epoch_keeps_exact_bound_additions_exact() -> None:
+    # Premise lock for _MANUAL_CLOCK_EPOCH: both exact-bound additions in
+    # test_health_stale_verifier_fails_closed_and_refresh_recovers must read
+    # exactly 20.0, else the boundary is off by ~1 ulp on every host.
+    first = _MANUAL_CLOCK_EPOCH + 20.0
+    assert first - _MANUAL_CLOCK_EPOCH == 20.0
+    renewed = _MANUAL_CLOCK_EPOCH + 20.001
+    second = renewed + 20.0
+    assert second - renewed == 20.0
 
 
 def test_health_stale_verifier_fails_closed_and_refresh_recovers(
@@ -1715,9 +2294,19 @@ def test_health_stale_verifier_fails_closed_and_refresh_recovers(
     assert client.get("/health").status_code == 200
 
     # Deterministic clock: the stale bound is 2 × 10 = 20 s. No sleeps.
-    base = store._health_last_refresh_monotonic
-    clock = _ManualStoreClock(base)
+    # Only the explicit refresh_health_verdict() calls below may advance the
+    # verdict under the manual clock: the verifier only runs under the serving
+    # lifespan (this bare TestClient never starts it — locked by the assert),
+    # and the stop is the ordered guard before the clock install.
+    assert not store.health_verifier_running()
+    store.stop_health_verifier()
+    clock = _ManualStoreClock(_MANUAL_CLOCK_EPOCH)
     monkeypatch.setattr(store_module, "time", clock)
+    # Re-anchor last_refresh to the fixed epoch through the production refresh
+    # entry point, then read the base AFTER the pause/clock install.
+    assert store.refresh_health_verdict().ready
+    base = store._health_last_refresh_monotonic
+    assert base == _MANUAL_CLOCK_EPOCH
 
     # (a) Exact boundary: age == bound is still fresh; age > bound is stale.
     clock.now = base + 20.0

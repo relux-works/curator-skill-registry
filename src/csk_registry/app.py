@@ -20,8 +20,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, __version__, home_from_env
+from . import CHECKPOINT_ENV, COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, __version__, home_from_env
 from .auth import AuditorTokens
+from .checkpoint import (
+    CHECKPOINT_NOT_CONFIGURED,
+    CHECKPOINT_SIGNATURE_INVALID,
+    CheckpointView,
+)
 from .clock import utc_now
 from .keys import load_active_key, public_keys
 from .limits import FixedWindowLimiter
@@ -201,9 +206,19 @@ def create_app(
     def health() -> dict[str, str]:
         # Cached verdict: no chain walk, no hashing, no I/O per probe. The
         # background verifier refreshes it; a failed or stale verdict is
-        # non-ready, exactly like a startup §5 mismatch.
-        if not store.health_verdict().ready:
-            raise APIError(503, "not_ready", "registry durable state failed integrity verification")
+        # non-ready, exactly like a startup §5 mismatch. A §6 startup
+        # checkpoint refusal reports its diagnostic as the error code.
+        verdict = store.health_verdict()
+        if not verdict.ready:
+            if verdict.code == "not_ready":
+                raise APIError(
+                    503, "not_ready", "registry durable state failed integrity verification"
+                )
+            raise APIError(
+                503,
+                verdict.code,
+                f"registry startup checkpoint comparison refused: {verdict.code}",
+            )
         return {"status": "ok"}
 
     @app.get("/v1/meta")
@@ -635,6 +650,100 @@ def _success_response(payload: dict[str, Any], *, status_code: int) -> JSONRespo
     )
 
 
+def ensure_startup_audit_sink() -> None:
+    """Attach the structured audit sink before the §6 startup enforcement runs.
+
+    ``serve`` constructs the app — running the startup checkpoint comparison —
+    before Uvicorn configures logging, so without this the INFO
+    ``startup_checkpoint`` posture/success events are dropped (the audit
+    logger inherits WARNING with no handler). This attaches a stderr sink at
+    INFO exactly once; refusal events keep their WARNING level and shape.
+    Idempotent: repeated calls add no further handlers and never raise.
+    """
+    if _AUDIT_LOG.level == logging.NOTSET or _AUDIT_LOG.level > logging.INFO:
+        _AUDIT_LOG.setLevel(logging.INFO)
+    if not _AUDIT_LOG.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _AUDIT_LOG.addHandler(handler)
+
+
+def _enforce_startup_checkpoint(store: Store, accepted_keys: tuple[str, ...]) -> None:
+    """Run the §6 startup checkpoint comparison (or record its absence).
+
+    Called after the §5 store verification and before the app is returned,
+    hence before the listener binds or ``/health`` can report ready. A
+    missing or empty ``CURATOR_SKILL_REGISTRY_CHECKPOINT`` starts the
+    service unchanged and records the ``checkpoint_not_configured``
+    posture. An unreadable or malformed checkpoint file is an operator
+    configuration error and fails startup. A well-formed checkpoint is
+    signature-checked first against the accepted (staged-rotation) keys,
+    then compared; either refusal latches non-ready plus writes-disabled
+    through the common integrity path while the process stays up.
+    """
+    configured = os.environ.get(CHECKPOINT_ENV)
+    if not configured:
+        _log_startup_checkpoint(
+            {"configured": False, "posture": CHECKPOINT_NOT_CONFIGURED}, refused=False
+        )
+        return
+    path = Path(configured).expanduser()
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"startup checkpoint is unreadable: {exc}") from exc
+    try:
+        snapshot = validate_snapshot(load_json(raw))
+        checkpoint = CheckpointView.from_snapshot(snapshot)
+    except ProtocolError as exc:
+        raise RuntimeError(
+            f"startup checkpoint is not a signed registry-snapshot-v1 object: {exc}"
+        ) from exc
+    live = store.snapshot_boundary()
+    compared: dict[str, Any] = {
+        "checkpoint": {
+            "version": checkpoint.version,
+            "log_size": checkpoint.log_size,
+            "head": checkpoint.head,
+        },
+        "live": {
+            "version": live.version,
+            "log_size": live.log_size,
+            "head": live.head,
+        },
+    }
+    if not any(verify_signed(key, snapshot) for key in accepted_keys):
+        diagnostic = CHECKPOINT_SIGNATURE_INVALID
+        store.refuse_startup_checkpoint(
+            diagnostic, f"startup checkpoint comparison refused: {diagnostic}"
+        )
+        _log_startup_checkpoint(
+            {"configured": True, "result": "refused", "diagnostic": diagnostic, **compared},
+            refused=True,
+        )
+        return
+    refused = store.apply_startup_checkpoint(checkpoint)
+    if refused is None:
+        _log_startup_checkpoint(
+            {"configured": True, "result": "ok", **compared}, refused=False
+        )
+    else:
+        _log_startup_checkpoint(
+            {"configured": True, "result": "refused", "diagnostic": refused, **compared},
+            refused=True,
+        )
+
+
+def _log_startup_checkpoint(fields: dict[str, Any], *, refused: bool) -> None:
+    event = {"event": "startup_checkpoint", **fields}
+    message = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    if refused:
+        _AUDIT_LOG.warning("%s", message)
+    else:
+        _AUDIT_LOG.info("%s", message)
+
+
 def app_from_env() -> FastAPI:
     home = Path(home_from_env()).expanduser()
     home.mkdir(parents=True, exist_ok=True)
@@ -650,11 +759,13 @@ def app_from_env() -> FastAPI:
         ),
     )
     tokens = AuditorTokens.from_file(home / "auditors.json")
+    verification_keys = public_keys(home, signing_key)
+    _enforce_startup_checkpoint(store, verification_keys)
     return create_app(
         store=store,
         signing_key=signing_key,
         tokens=tokens,
-        verification_keys=public_keys(home, signing_key),
+        verification_keys=verification_keys,
         max_concurrent_requests=_positive_env(
             "CURATOR_SKILL_REGISTRY_MAX_CONCURRENT_REQUESTS",
             DEFAULT_MAX_CONCURRENT_REQUESTS,
