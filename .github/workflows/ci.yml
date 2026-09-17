@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # gate/** carries the throwaway snapshots scripts/remote-gate.sh pushes
+    # for task-board Story workspaces; they are deleted once the run ends.
+    branches: [main, 'gate/**']
   pull_request:
     branches: [main]
 
