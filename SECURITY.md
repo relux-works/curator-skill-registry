@@ -24,7 +24,10 @@ Restore is fail-closed: `verify-backup` validates the full store and requires a
 signed external high-water checkpoint before the database can serve the same
 canonical URL. Keep checkpoints and secret backups outside the primary store,
 encrypted and access controlled. Cursor and response data never bootstrap
-trust; clients pin registry keys out of band.
+trust; clients pin registry keys out of band. Pagination is fail-closed too: a
+cursor page is served only at the cursor's carried boundary, and a carried
+boundary that disagrees with the committed log or is no longer available is
+refused with `404 invalid_cursor` rather than re-evaluated at a newer boundary.
 
 The complete normative threat model and deployment requirements are in the
 [Curator registry-service profile](https://github.com/relux-works/curator-spec/blob/main/profiles/registry-service.md).

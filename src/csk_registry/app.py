@@ -23,7 +23,13 @@ from .clock import utc_now
 from .keys import load_active_key, public_keys
 from .limits import FixedWindowLimiter
 from .permissions import protect_private_directory
-from .protocol import ProtocolError, load_json, validate_record, validate_source_identity
+from .protocol import (
+    ProtocolError,
+    load_json,
+    validate_record,
+    validate_snapshot,
+    validate_source_identity,
+)
 from .signing import (
     SigningKey,
     canonical_bytes,
@@ -32,7 +38,13 @@ from .signing import (
     verify_signed,
 )
 from .snapshot import build_snapshot
-from .store import IdempotencyConflict, SnapshotBoundary, Store, StoreIntegrityError
+from .store import (
+    CursorBoundaryMismatch,
+    IdempotencyConflict,
+    SnapshotBoundary,
+    Store,
+    StoreIntegrityError,
+)
 
 
 MAX_PAGE_SIZE = 1000
@@ -228,36 +240,51 @@ def create_app(
             "limit": limit,
         }
         if cursor:
-            offset, boundary = _cursor_state(
+            offset, boundary, boundary_snapshot = _cursor_state(
                 store,
                 cursor,
                 endpoint="records",
                 query=query,
                 verification_keys=accepted_signing_keys,
             )
+            try:
+                found, more = store.records_page(
+                    source_identity=source_identity,
+                    commit=commit,
+                    content_sha256=content_sha256,
+                    limit=limit,
+                    offset=offset,
+                    boundary=boundary,
+                )
+            except CursorBoundaryMismatch as exc:
+                raise APIError(
+                    404, "invalid_cursor", "pagination cursor is invalid or expired"
+                ) from exc
         else:
-            offset, boundary = 0, store.snapshot_boundary()
-        found, more = store.records_page(
-            source_identity=source_identity,
-            commit=commit,
-            content_sha256=content_sha256,
-            limit=limit,
-            offset=offset,
-            max_seq=boundary.log_size,
-        )
+            offset = 0
+            boundary = store.snapshot_boundary()
+            boundary_snapshot = build_snapshot(store, signing_key, boundary=boundary)
+            found, more = store.records_page(
+                source_identity=source_identity,
+                commit=commit,
+                content_sha256=content_sha256,
+                limit=limit,
+                offset=offset,
+                max_seq=boundary.log_size,
+            )
         next_cursor = (
             _encode_cursor(
                 signing_key,
                 endpoint="records",
                 query=query,
-                boundary=boundary,
+                boundary_snapshot=boundary_snapshot,
                 offset=offset + len(found),
             )
             if more
             else None
         )
         response.headers["Cache-Control"] = f"public, max-age={CURSOR_TTL_SECONDS}"
-        return {"records": found, "next_cursor": next_cursor}
+        return {"records": found, "next_cursor": next_cursor, "boundary": boundary_snapshot}
 
     @app.get("/v1/snapshot")
     def snapshot(response: Response) -> dict[str, Any]:
@@ -275,21 +302,34 @@ def create_app(
         _validate_query_parameters(request, {"since", "limit", "cursor"})
         query = {"since": since, "limit": limit}
         if cursor:
-            offset, boundary = _cursor_state(
+            offset, boundary, boundary_snapshot = _cursor_state(
                 store,
                 cursor,
                 endpoint="log",
                 query=query,
                 verification_keys=accepted_signing_keys,
             )
+            try:
+                entries, more = store.log_page(
+                    since=since,
+                    limit=limit,
+                    offset=offset,
+                    boundary=boundary,
+                )
+            except CursorBoundaryMismatch as exc:
+                raise APIError(
+                    404, "invalid_cursor", "pagination cursor is invalid or expired"
+                ) from exc
         else:
-            offset, boundary = 0, store.snapshot_boundary()
-        entries, more = store.log_page(
-            since=since,
-            limit=limit,
-            offset=offset,
-            max_seq=boundary.log_size,
-        )
+            offset = 0
+            boundary = store.snapshot_boundary()
+            boundary_snapshot = build_snapshot(store, signing_key, boundary=boundary)
+            entries, more = store.log_page(
+                since=since,
+                limit=limit,
+                offset=offset,
+                max_seq=boundary.log_size,
+            )
         encoded = [
             {"seq": entry.seq, "entry_hash": entry.entry_hash, "prev_hash": entry.prev_hash, "record": entry.record}
             for entry in entries
@@ -299,14 +339,14 @@ def create_app(
                 signing_key,
                 endpoint="log",
                 query=query,
-                boundary=boundary,
+                boundary_snapshot=boundary_snapshot,
                 offset=offset + len(entries),
             )
             if more
             else None
         )
         response.headers["Cache-Control"] = f"public, max-age={CURSOR_TTL_SECONDS}"
-        return {"entries": encoded, "next_cursor": next_cursor}
+        return {"entries": encoded, "next_cursor": next_cursor, "boundary": boundary_snapshot}
 
     @app.post("/v1/records")
     async def submit(
@@ -398,13 +438,21 @@ def _encode_cursor(
     *,
     endpoint: str,
     query: dict[str, Any],
-    boundary: SnapshotBoundary,
+    boundary_snapshot: dict[str, Any],
     offset: int,
 ) -> str:
+    """Encode a cursor carrying the complete signed chain boundary.
+
+    The ``snapshot`` member is the full ``registry-snapshot-v1`` object
+    (including ``sig``) served as the page ``boundary``. Cursor pages echo it
+    verbatim instead of re-signing, so a chain spanning a staged key rotation
+    keeps one byte-identical ``boundary`` (registry §9.3). The cursor envelope
+    itself is signed with the active key; only the carried boundary is pinned.
+    """
     payload = canonical_document_bytes(
         {
             "query": _query_digest(endpoint, query),
-            "snapshot": boundary.as_dict(),
+            "snapshot": boundary_snapshot,
             "offset": offset,
             "expires_at": int(time.time()) + CURSOR_TTL_SECONDS,
         }
@@ -420,7 +468,22 @@ def _cursor_state(
     endpoint: str,
     query: dict[str, Any],
     verification_keys: tuple[str, ...],
-) -> tuple[int, SnapshotBoundary]:
+) -> tuple[int, SnapshotBoundary, dict[str, Any]]:
+    """Decode a cursor into offset, boundary body, and carried snapshot.
+
+    The carried snapshot is the exact signed ``boundary`` the chain was issued
+    with; callers echo it verbatim. It must verify against the accepted key
+    set, so a cursor stays usable across a staged rotation only inside the
+    promised overlap and is refused (never re-signed) once its key retires.
+    Cursors issued before the carried snapshot existed fail shape validation.
+
+    The carried boundary body is verified against the store here (a
+    signed-but-inconsistent object, an unavailable size, or a pruned prefix is
+    ``invalid_cursor``), and callers additionally pass it to the store paging
+    call, which re-verifies it structurally under the paging lock. A cursor
+    page is therefore served only at the cursor's carried boundary — never
+    re-evaluated at a newer one.
+    """
     try:
         if len(cursor) > 4096:
             raise ValueError("length")
@@ -439,7 +502,15 @@ def _cursor_state(
             raise ValueError("shape")
         if decoded.get("query") != _query_digest(endpoint, query):
             raise ValueError("query")
-        boundary = SnapshotBoundary.from_dict(decoded.get("snapshot"))
+        snapshot = validate_snapshot(decoded.get("snapshot"))
+        if not any(verify_signed(public_key, snapshot) for public_key in verification_keys):
+            raise ValueError("snapshot signature")
+        boundary = SnapshotBoundary.from_dict(
+            {
+                field: snapshot[field]
+                for field in ("version", "log_size", "head", "merkle_root", "created_at")
+            }
+        )
         if not store.boundary_available(boundary):
             raise ValueError("snapshot")
         offset = decoded.get("offset")
@@ -453,7 +524,7 @@ def _cursor_state(
             or expires_at < int(time.time())
         ):
             raise ValueError("value")
-        return offset, boundary
+        return offset, boundary, snapshot
     except (ValueError, ProtocolError) as exc:
         raise APIError(404, "invalid_cursor", "pagination cursor is invalid or expired") from exc
 

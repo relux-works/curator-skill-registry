@@ -23,7 +23,7 @@ from csk_registry import (
     home_from_env,
     signing,
 )
-from csk_registry.app import create_app
+from csk_registry.app import _encode_cursor, create_app
 from csk_registry.auth import Auditor, AuditorTokens
 from csk_registry.cli import build_parser, main
 from csk_registry.keys import load_active_key, public_keys
@@ -35,7 +35,12 @@ from csk_registry.permissions import (
 )
 from csk_registry.protocol import ProtocolError, portable_path, validate_record, validate_source_identity
 from csk_registry.snapshot import build_snapshot
-from csk_registry.store import SnapshotBoundary, Store, StoreIntegrityError
+from csk_registry.store import (
+    CursorBoundaryMismatch,
+    SnapshotBoundary,
+    Store,
+    StoreIntegrityError,
+)
 
 
 def test_public_project_and_cli_identity(monkeypatch: pytest.MonkeyPatch):
@@ -686,6 +691,8 @@ def test_staged_key_rotation_preserves_snapshot_body_and_live_cursors(tmp_path: 
     )
     assert first.status_code == 200
     cursor = first.json()["next_cursor"]
+    assert isinstance(cursor, str) and 1 <= len(cursor) <= 4096
+    first_boundary = first.json()["boundary"]
     old_snapshot = before.get("/v1/snapshot").json()
 
     assert main(["--home", str(home), "genkey", "--force"]) == 1
@@ -718,6 +725,8 @@ def test_staged_key_rotation_preserves_snapshot_body_and_live_cursors(tmp_path: 
     )
     assert continued.status_code == 200
     assert [record["name"] for record in continued.json()["records"]] == ["skill-1"]
+    assert continued.json()["boundary"] == first_boundary
+    assert signing.verify_signed(old_key.public_pinned, continued.json()["boundary"])
 
     assert main(["--home", str(home), "retire-key", old_key.key_id]) == 1
     assert main(
@@ -730,6 +739,106 @@ def test_staged_key_rotation_preserves_snapshot_body_and_live_cursors(tmp_path: 
         ]
     ) == 0
     assert public_keys(home, new_key) == (new_key.public_pinned,)
+
+
+def test_rotation_overlap_keeps_chain_boundary_on_both_endpoints(tmp_path: Path):
+    home = tmp_path / "home"
+    assert main(["--home", str(home), "genkey"]) == 0
+    old_key = load_active_key(home)
+    store = Store(home / "registry.db")
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(3):
+        store.append(
+            old_key.sign_record(_body(name=f"skill-{index}", commit=f"{index:040d}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    before = TestClient(
+        create_app(
+            store=store,
+            signing_key=old_key,
+            tokens=AuditorTokens([]),
+            verification_keys=public_keys(home, old_key),
+        )
+    )
+    records_first = before.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    log_first = before.get("/v1/log", params={"since": 0, "limit": 1}).json()
+    records_cursor = records_first["next_cursor"]
+    log_cursor = log_first["next_cursor"]
+    assert isinstance(records_cursor, str) and 1 <= len(records_cursor) <= 4096
+    assert isinstance(log_cursor, str) and 1 <= len(log_cursor) <= 4096
+    records_chain = signing.canonical_document_bytes(records_first["boundary"])
+    log_chain = signing.canonical_document_bytes(log_first["boundary"])
+
+    assert main(["--home", str(home), "prepare-key-rotation"]) == 0
+    assert main(
+        ["--home", str(home), "activate-key-rotation", "--confirm-pins-deployed"]
+    ) == 0
+    new_key = load_active_key(home)
+    retained = public_keys(home, new_key)
+    assert {old_key.public_pinned, new_key.public_pinned} == set(retained)
+    during = TestClient(
+        create_app(
+            store=store,
+            signing_key=new_key,
+            tokens=AuditorTokens([]),
+            verification_keys=retained,
+        )
+    )
+    # Snapshot reads move to the new signer while cursor chains stay pinned.
+    assert during.get("/v1/snapshot").json()["sig"]["key_id"] == new_key.key_id
+
+    chains = [
+        ("/v1/records", {"content_sha256": content_hash, "limit": 1}, records_cursor, records_chain),
+        ("/v1/log", {"since": 0, "limit": 1}, log_cursor, log_chain),
+    ]
+    overlap_issued: list[tuple[str, dict[str, object], str]] = []
+    for endpoint, params, first_cursor, chain in chains:
+        cursor = first_cursor
+        pages = 0
+        while cursor is not None:
+            response = during.get(endpoint, params={**params, "cursor": cursor})
+            assert response.status_code == 200
+            body = response.json()
+            assert signing.canonical_document_bytes(body["boundary"]) == chain
+            assert signing.verify_signed(old_key.public_pinned, body["boundary"])
+            assert not signing.verify_signed(new_key.public_pinned, body["boundary"])
+            cursor = body["next_cursor"]
+            if cursor is not None:
+                overlap_issued.append((endpoint, params, cursor))
+            pages += 1
+        assert pages == 2
+
+    assert main(
+        [
+            "--home",
+            str(home),
+            "retire-key",
+            old_key.key_id,
+            "--confirm-overlap-elapsed",
+        ]
+    ) == 0
+    assert public_keys(home, new_key) == (new_key.public_pinned,)
+    retired = TestClient(
+        create_app(
+            store=store,
+            signing_key=new_key,
+            tokens=AuditorTokens([]),
+            verification_keys=public_keys(home, new_key),
+        )
+    )
+    # Pre-rotation cursors and overlap-issued continuations are refused once the
+    # carried boundary's key retires; the service never re-signs the chain.
+    stale = [(endpoint, params, first_cursor) for endpoint, params, first_cursor, _ in chains]
+    for endpoint, params, cursor in [*stale, *overlap_issued]:
+        refused = retired.get(endpoint, params={**params, "cursor": cursor})
+        assert refused.status_code == 404
+        assert refused.json()["error"]["code"] == "invalid_cursor"
+    fresh = retired.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    assert signing.verify_signed(new_key.public_pinned, fresh["boundary"])
 
 
 def test_serve_refuses_insecure_or_ambiguous_transport(tmp_path: Path):
@@ -777,3 +886,363 @@ def test_errors_use_stable_protocol_envelope(tmp_path: Path, method: str, path: 
     assert response.status_code == expected_status
     error = response.json()["error"]
     assert set(error) >= {"code", "message"}
+
+
+def test_records_pages_carry_byte_identical_boundary(tmp_path: Path):
+    client, registry_key, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(3):
+        record = auditor_key.sign_record(_body(name=f"skill-{index}"))
+        assert client.post(
+            "/v1/records", json=record, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 201
+    snapshot = client.get("/v1/snapshot").json()
+    first = client.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    assert set(first) == {"records", "next_cursor", "boundary"}
+    assert first["boundary"] == snapshot
+    assert signing.verify_signed(registry_key.public_pinned, first["boundary"])
+    # An append after the first page must not move the chain's boundary.
+    replacement = auditor_key.sign_record(_body("revoked", name="skill-0"))
+    assert client.post(
+        "/v1/records", json=replacement, headers={"Authorization": f"Bearer {token}"}
+    ).status_code == 201
+    chain = signing.canonical_document_bytes(first["boundary"])
+    body = first
+    names = [record["name"] for record in body["records"]]
+    while body["next_cursor"] is not None:
+        body = client.get(
+            "/v1/records",
+            params={"content_sha256": content_hash, "limit": 1, "cursor": body["next_cursor"]},
+        ).json()
+        assert set(body) == {"records", "next_cursor", "boundary"}
+        assert signing.verify_signed(registry_key.public_pinned, body["boundary"])
+        assert signing.canonical_document_bytes(body["boundary"]) == chain
+        names.extend(record["name"] for record in body["records"])
+    assert names == ["skill-0", "skill-1", "skill-2"]
+    assert body["boundary"]["created_at"] == snapshot["created_at"]
+    assert client.get("/v1/snapshot").json()["log_size"] == snapshot["log_size"] + 1
+
+
+def test_log_pages_carry_byte_identical_boundary(tmp_path: Path):
+    client, registry_key, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    for index in range(3):
+        record = auditor_key.sign_record(_body("audited", commit=f"{index:040d}"))
+        assert client.post(
+            "/v1/records", json=record, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 201
+    snapshot = client.get("/v1/snapshot").json()
+    first = client.get("/v1/log", params={"limit": 1}).json()
+    assert set(first) == {"entries", "next_cursor", "boundary"}
+    assert first["boundary"] == snapshot
+    assert signing.verify_signed(registry_key.public_pinned, first["boundary"])
+    late = auditor_key.sign_record(_body("audited", commit=f"{3:040d}"))
+    assert client.post(
+        "/v1/records", json=late, headers={"Authorization": f"Bearer {token}"}
+    ).status_code == 201
+    chain = signing.canonical_document_bytes(first["boundary"])
+    body = first
+    sequences = [entry["seq"] for entry in body["entries"]]
+    while body["next_cursor"] is not None:
+        body = client.get(
+            "/v1/log",
+            params={"limit": 1, "cursor": body["next_cursor"]},
+        ).json()
+        assert set(body) == {"entries", "next_cursor", "boundary"}
+        assert signing.verify_signed(registry_key.public_pinned, body["boundary"])
+        assert signing.canonical_document_bytes(body["boundary"]) == chain
+        sequences.extend(entry["seq"] for entry in body["entries"])
+    assert sequences == [1, 2, 3]
+    assert body["boundary"]["log_size"] == snapshot["log_size"]
+    assert client.get("/v1/snapshot").json()["log_size"] == snapshot["log_size"] + 1
+
+
+def _flip_hex(value: str) -> str:
+    return "00" * 32 if value != "00" * 32 else "ff" * 32
+
+
+def test_cursor_carried_boundary_disagreement_refused_on_both_endpoints(tmp_path: Path):
+    client, registry_key, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(3):
+        record = auditor_key.sign_record(_body(name=f"skill-{index}"))
+        assert client.post(
+            "/v1/records", json=record, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 201
+    records_first = client.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    log_first = client.get("/v1/log", params={"since": 0, "limit": 1}).json()
+    assert records_first["next_cursor"] and log_first["next_cursor"]
+    # Control: the genuine cursors continue the chain at the original boundary.
+    genuine_records = client.get(
+        "/v1/records",
+        params={
+            "content_sha256": content_hash,
+            "limit": 1,
+            "cursor": records_first["next_cursor"],
+        },
+    )
+    assert genuine_records.status_code == 200
+    assert genuine_records.json()["boundary"] == records_first["boundary"]
+
+    cases = [
+        (
+            "/v1/records",
+            "records",
+            {"source_identity": "", "commit": "", "content_sha256": content_hash, "limit": 1},
+            {"content_sha256": content_hash, "limit": 1},
+            records_first["boundary"],
+        ),
+        (
+            "/v1/log",
+            "log",
+            {"since": 0, "limit": 1},
+            {"since": 0, "limit": 1},
+            log_first["boundary"],
+        ),
+    ]
+    for endpoint, name, query, params, boundary in cases:
+        for field in ("head", "merkle_root"):
+            forged = dict(boundary)
+            forged[field] = _flip_hex(forged[field])
+            # The forged body is genuinely re-signed with a key the service
+            # accepts, so only the store comparison can refuse it.
+            signed = registry_key.sign_record(forged)
+            assert signing.verify_signed(registry_key.public_pinned, signed)
+            forged_cursor = _encode_cursor(
+                registry_key,
+                endpoint=name,
+                query=query,
+                boundary_snapshot=signed,
+                offset=1,
+            )
+            refused = client.get(endpoint, params={**params, "cursor": forged_cursor})
+            assert refused.status_code == 404, (endpoint, field)
+            assert refused.json()["error"]["code"] == "invalid_cursor", (endpoint, field)
+
+
+def test_cursor_disagreement_refused_for_overlap_key_signature(tmp_path: Path):
+    old_key = signing.generate_key()
+    new_key = signing.generate_key()
+    store = Store(tmp_path / "overlap-disagreement.db")
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(2):
+        store.append(
+            new_key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    client = TestClient(
+        create_app(
+            store=store,
+            signing_key=new_key,
+            tokens=AuditorTokens([]),
+            verification_keys=(old_key.public_pinned,),
+        )
+    )
+    records_first = client.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    log_first = client.get("/v1/log", params={"since": 0, "limit": 1}).json()
+    cases = [
+        (
+            "/v1/records",
+            "records",
+            {"source_identity": "", "commit": "", "content_sha256": content_hash, "limit": 1},
+            {"content_sha256": content_hash, "limit": 1},
+            records_first["boundary"],
+        ),
+        (
+            "/v1/log",
+            "log",
+            {"since": 0, "limit": 1},
+            {"since": 0, "limit": 1},
+            log_first["boundary"],
+        ),
+    ]
+    for endpoint, name, query, params, boundary in cases:
+        forged = dict(boundary)
+        forged["head"] = _flip_hex(forged["head"])
+        # Re-signed with the retained overlap key: the signature verifies, but
+        # the body disagrees with the store, so the page must be refused.
+        signed = old_key.sign_record(forged)
+        assert signing.verify_signed(old_key.public_pinned, signed)
+        forged_cursor = _encode_cursor(
+            new_key,
+            endpoint=name,
+            query=query,
+            boundary_snapshot=signed,
+            offset=1,
+        )
+        refused = client.get(endpoint, params={**params, "cursor": forged_cursor})
+        assert refused.status_code == 404, endpoint
+        assert refused.json()["error"]["code"] == "invalid_cursor", endpoint
+
+
+def test_cursor_unavailable_boundary_refused_on_both_endpoints(tmp_path: Path):
+    client, registry_key, token = _client(tmp_path / "future")
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(2):
+        record = auditor_key.sign_record(_body(name=f"skill-{index}"))
+        assert client.post(
+            "/v1/records", json=record, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 201
+    records_first = client.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    log_first = client.get("/v1/log", params={"since": 0, "limit": 1}).json()
+    cases = [
+        (
+            "/v1/records",
+            "records",
+            {"source_identity": "", "commit": "", "content_sha256": content_hash, "limit": 1},
+            {"content_sha256": content_hash, "limit": 1},
+            records_first["boundary"],
+        ),
+        (
+            "/v1/log",
+            "log",
+            {"since": 0, "limit": 1},
+            {"since": 0, "limit": 1},
+            log_first["boundary"],
+        ),
+    ]
+    # A carried boundary past the committed head is unavailable: 404, never a
+    # re-evaluation at the newer (or any other) boundary.
+    for endpoint, name, query, params, boundary in cases:
+        future = dict(boundary)
+        future["version"] = future["log_size"] = boundary["log_size"] + 3
+        signed = registry_key.sign_record(future)
+        assert signing.verify_signed(registry_key.public_pinned, signed)
+        forged_cursor = _encode_cursor(
+            registry_key,
+            endpoint=name,
+            query=query,
+            boundary_snapshot=signed,
+            offset=1,
+        )
+        refused = client.get(endpoint, params={**params, "cursor": forged_cursor})
+        assert refused.status_code == 404, endpoint
+        assert refused.json()["error"]["code"] == "invalid_cursor", endpoint
+
+
+def test_cursor_pruned_prefix_refused_on_both_endpoints(tmp_path: Path):
+    client, _, token = _client(tmp_path / "pruned")
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(3):
+        record = auditor_key.sign_record(_body(name=f"skill-{index}"))
+        assert client.post(
+            "/v1/records", json=record, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 201
+    records_first = client.get(
+        "/v1/records", params={"content_sha256": content_hash, "limit": 1}
+    ).json()
+    log_first = client.get("/v1/log", params={"since": 0, "limit": 1}).json()
+    records_cursor = records_first["next_cursor"]
+    log_cursor = log_first["next_cursor"]
+    assert records_cursor and log_cursor
+    # Control: both cursors work before the prefix is pruned.
+    assert (
+        client.get(
+            "/v1/records",
+            params={
+                "content_sha256": content_hash,
+                "limit": 1,
+                "cursor": records_cursor,
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/v1/log", params={"since": 0, "limit": 1, "cursor": log_cursor}
+        ).status_code
+        == 200
+    )
+    # Prune the earliest log row behind the store: the carried log_size prefix
+    # no longer exists, so the cursors must be refused, not re-evaluated.
+    pruned = sqlite3.connect(tmp_path / "pruned" / "r.db")
+    try:
+        pruned.execute("DELETE FROM log WHERE seq = 1")
+        pruned.commit()
+    finally:
+        pruned.close()
+    for endpoint, params in (
+        (
+            "/v1/records",
+            {"content_sha256": content_hash, "limit": 1, "cursor": records_cursor},
+        ),
+        ("/v1/log", {"since": 0, "limit": 1, "cursor": log_cursor}),
+    ):
+        refused = client.get(endpoint, params=params)
+        assert refused.status_code == 404, endpoint
+        assert refused.json()["error"]["code"] == "invalid_cursor", endpoint
+
+
+def test_store_page_calls_verify_carried_boundary(tmp_path: Path):
+    store = Store(tmp_path / "r.db")
+    key = signing.generate_key()
+    content_hash = "sha256:" + "1f" * 32
+    for index in range(2):
+        store.append(
+            key.sign_record(_body(name=f"skill-{index}")),
+            created_at=f"2026-07-13T00:00:0{index}Z",
+        )
+    boundary = store.snapshot_boundary()
+    # The committed boundary pages exactly like the equivalent max_seq cap.
+    via_boundary, more_boundary = store.records_page(
+        content_sha256=content_hash, limit=10, offset=0, boundary=boundary
+    )
+    via_cap, more_cap = store.records_page(
+        content_sha256=content_hash, limit=10, offset=0, max_seq=boundary.log_size
+    )
+    assert (via_boundary, more_boundary) == (via_cap, more_cap)
+    log_via_boundary, _ = store.log_page(since=0, limit=10, offset=0, boundary=boundary)
+    log_via_cap, _ = store.log_page(
+        since=0, limit=10, offset=0, max_seq=boundary.log_size
+    )
+    assert [entry.seq for entry in log_via_boundary] == [
+        entry.seq for entry in log_via_cap
+    ]
+    # A boundary whose body disagrees with the store is a mismatch.
+    tampered = SnapshotBoundary(
+        version=boundary.version,
+        log_size=boundary.log_size,
+        head=_flip_hex(boundary.head),
+        merkle_root=boundary.merkle_root,
+        created_at=boundary.created_at,
+    )
+    with pytest.raises(CursorBoundaryMismatch):
+        store.records_page(
+            content_sha256=content_hash, limit=10, offset=0, boundary=tampered
+        )
+    with pytest.raises(CursorBoundaryMismatch):
+        store.log_page(since=0, limit=10, offset=0, boundary=tampered)
+    # An unavailable size and an explicit double cap are rejected too.
+    future = SnapshotBoundary(
+        version=boundary.version + 5,
+        log_size=boundary.log_size + 5,
+        head=boundary.head,
+        merkle_root=boundary.merkle_root,
+        created_at=boundary.created_at,
+    )
+    with pytest.raises(CursorBoundaryMismatch):
+        store.records_page(
+            content_sha256=content_hash, limit=10, offset=0, boundary=future
+        )
+    with pytest.raises(CursorBoundaryMismatch):
+        store.log_page(since=0, limit=10, offset=0, boundary=future)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        store.records_page(
+            content_sha256=content_hash,
+            limit=10,
+            offset=0,
+            max_seq=boundary.log_size,
+            boundary=boundary,
+        )

@@ -33,6 +33,19 @@
 
 ### Security
 
+- R1: `GET /v1/records` and `GET /v1/log` page envelopes now carry the
+  REQUIRED `boundary` member: the complete signed snapshot object
+  (`registry-snapshot-v1`, all fields including `sig`) at which the page was
+  evaluated, byte-identical across one cursor chain. Envelopes validate
+  against `records-response-v2` / `log-response-v2` (curator-spec `dced9b8`).
+  Cursors carry that complete signed boundary, so a chain stays byte-identical
+  across a staged key rotation; cursors whose boundary key has retired are
+  refused with `404 invalid_cursor`. P1: a cursor page is served only at the
+  cursor's carried boundary — the carried `head`/`merkle_root`/`log_size` are
+  verified against the store before serving, and any disagreement, unavailable
+  size, or pruned prefix is `404 invalid_cursor` with no re-evaluation at a
+  newer boundary, on both endpoints (curator-spec `dced9b8`,
+  `pagination.cursor_boundary_cases`).
 - `genkey --force` now refuses to replace the signer of a non-empty registry.
 - Corrupt log, projection, snapshot, idempotency, or import-ledger state fails
   readiness instead of truncating or repairing authoritative history.

@@ -23,6 +23,11 @@ Ed25519 keys before trusting it.
   must verify against that key.
 - Signed pagination cursors bind the query to one immutable snapshot boundary;
   concurrent appends cannot duplicate, omit, replace, or reorder later pages.
+  Every records and log page states that boundary in its signed `boundary`
+  member, byte-identical across one cursor chain. A cursor page is served only
+  at its carried boundary: a carried boundary that disagrees with the store or
+  is no longer available is refused with `404 invalid_cursor`, never
+  re-evaluated at a newer boundary.
 - Log append, snapshot state, and auditor-scoped idempotency commit in one
   serialized durable transaction. Startup fails closed on chain or ledger
   corruption.
@@ -55,9 +60,11 @@ docker compose exec registry curator-skill-registry --home /data genkey
 - `GET /health`
 - `GET /v1/meta` registry name, public keys, schema versions, policy
 - `GET /v1/records?source_identity=&commit=` or `?content_sha256=` with
-  `limit`, `cursor`, and `next_cursor`
+  `limit`, `cursor`, and `next_cursor`; every page carries the signed
+  `boundary` snapshot it was evaluated at
 - `GET /v1/snapshot` signed Merkle root, size, version, timestamp
-- `GET /v1/log?since=` paginated transparency log entries
+- `GET /v1/log?since=` paginated transparency log entries, each page carrying
+  its signed `boundary`
 - `POST /v1/records` submit a signed record (auditor token required;
   `Idempotency-Key` supported)
 

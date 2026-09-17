@@ -122,6 +122,10 @@ class IdempotencyConflict(ValueError):
     pass
 
 
+class CursorBoundaryMismatch(ValueError):
+    """A page was requested at a boundary the store disagrees with."""
+
+
 class StoreIntegrityError(RuntimeError):
     pass
 
@@ -582,15 +586,16 @@ class Store:
         limit: int,
         offset: int,
         max_seq: int | None = None,
+        boundary: SnapshotBoundary | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         if bool(source_identity) != bool(commit):
             raise ValueError("source_identity and commit must appear together")
         if not ((source_identity and commit) or content_sha256):
             return [], False
         with self._lock, self._operation_deadline():
-            boundary = self._snapshot_boundary_locked(max_seq).log_size
+            cap = self._page_boundary_locked(boundary, max_seq).log_size
             clauses = ["seq <= ?"]
-            params: list[Any] = [boundary]
+            params: list[Any] = [cap]
             if source_identity:
                 clauses.extend(["source_identity = ?", "commit_hash = ?"])
                 params.extend([source_identity, commit])
@@ -630,13 +635,14 @@ class Store:
         limit: int,
         offset: int,
         max_seq: int | None = None,
+        boundary: SnapshotBoundary | None = None,
     ) -> tuple[list[LogEntry], bool]:
         with self._lock, self._operation_deadline():
-            boundary = self._snapshot_boundary_locked(max_seq).log_size
+            cap = self._page_boundary_locked(boundary, max_seq).log_size
             rows = self._conn.execute(
                 "SELECT seq, entry_hash, prev_hash, record_json FROM log "
                 "WHERE seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ? OFFSET ?",
-                (since, boundary, limit + 1, offset),
+                (since, cap, limit + 1, offset),
             ).fetchall()
             return [_entry_from_row(row) for row in rows[:limit]], len(rows) > limit
 
@@ -668,6 +674,36 @@ class Store:
     def snapshot_boundary(self, max_seq: int | None = None) -> SnapshotBoundary:
         with self._lock, self._operation_deadline():
             return self._snapshot_boundary_locked(max_seq)
+
+    def _page_boundary_locked(
+        self,
+        boundary: SnapshotBoundary | None,
+        max_seq: int | None,
+    ) -> SnapshotBoundary:
+        """Resolve the boundary a page is evaluated at.
+
+        Cursor pages pass the cursor's carried boundary: it is verified
+        structurally against the store (head, Merkle root, size, timestamp at
+        that log size) under the paging lock, and any disagreement — a forged
+        body, an unavailable size, or a pruned prefix — is
+        :class:`CursorBoundaryMismatch`, never a silent re-evaluation at a
+        newer boundary.
+        """
+        if boundary is not None and max_seq is not None:
+            raise ValueError("page boundary and max_seq are mutually exclusive")
+        if boundary is None:
+            return self._snapshot_boundary_locked(max_seq)
+        try:
+            actual = self._snapshot_boundary_locked(boundary.log_size)
+        except (ValueError, StoreIntegrityError) as exc:
+            raise CursorBoundaryMismatch(
+                "cursor boundary is not available in this store"
+            ) from exc
+        if actual != boundary:
+            raise CursorBoundaryMismatch(
+                "cursor boundary disagrees with the committed log prefix"
+            )
+        return actual
 
     def _snapshot_boundary_locked(self, max_seq: int | None) -> SnapshotBoundary:
         head_row = self._conn.execute(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -10,9 +11,12 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator, ValidationError
+from referencing import Registry
+from referencing.jsonschema import DRAFT202012
 
 from csk_registry import signing
-from csk_registry.app import create_app
+from csk_registry.app import _encode_cursor, create_app
 from csk_registry.auth import Auditor, AuditorTokens
 from csk_registry.bundle import import_bundle
 from csk_registry.protocol import (
@@ -165,6 +169,420 @@ def test_shared_service_snapshot_bound_pagination_vector(tmp_path: Path) -> None
     ]
     current = store.records_for(**query)
     assert [record["audit"]["case"] for record in current] == case["expected_new_query_ids"]
+
+
+def _schema_dir() -> Path:
+    path = _root().parent.parent / "schemas" / "v1"
+    assert path.is_dir(), f"spec schema dir not found: {path}"
+    return path
+
+
+def _envelope_validator(schema_name: str) -> Draft202012Validator:
+    """Draft 2020-12 validator for a v2 envelope with local $ref resolution."""
+    schema = json.loads((_schema_dir() / schema_name).read_text(encoding="utf-8"))
+    assert schema.get("additionalProperties") is False
+    resources = []
+    for schema_path in sorted(_schema_dir().glob("*.schema.json")):
+        candidate = json.loads(schema_path.read_text(encoding="utf-8"))
+        resources.append((candidate["$id"], DRAFT202012.create_resource(candidate)))
+    return Draft202012Validator(schema, registry=Registry().with_resources(resources))
+
+
+def _assert_valid_envelope(schema_name: str, envelope: Any) -> None:
+    _envelope_validator(schema_name).validate(envelope)
+
+
+def _assert_invalid_envelope(schema_name: str, envelope: Any) -> None:
+    with pytest.raises(ValidationError):
+        _envelope_validator(schema_name).validate(envelope)
+
+
+@pytest.mark.parametrize(
+    "schema_name",
+    [
+        "records-response-v2.schema.json",
+        "log-response-v2.schema.json",
+    ],
+)
+def test_shared_service_page_envelope_schema_cases(schema_name: str) -> None:
+    validator = _envelope_validator(schema_name)
+    index = json.loads((_root() / "schema-cases" / "index.json").read_text(encoding="utf-8"))
+    cases = [entry for entry in index if entry["schema"] == schema_name]
+    assert cases, f"no schema-cases registered for {schema_name}"
+    for entry in cases:
+        instance = json.loads(
+            (_root() / "schema-cases" / entry["instance"]).read_text(encoding="utf-8")
+        )
+        if entry["valid"]:
+            validator.validate(instance)
+        else:
+            with pytest.raises(ValidationError):
+                validator.validate(instance)
+
+
+def test_shared_service_log_harness_rejects_malformed_entry_hash(tmp_path: Path) -> None:
+    """A served log envelope with a non-hex entry_hash fails the real schema."""
+    registry_key = signing.generate_key()
+    store = Store(tmp_path / "bad-hash-registry.db")
+    store.append(
+        registry_key.sign_record(
+            {
+                "schema_version": 1,
+                "name": "hash-case",
+                "source_identity": "git.example.com/skills/hash-case",
+                "commit": "c" * 40,
+                "content_sha256": "sha256:" + "d" * 64,
+                "status": "audited",
+                "audit": {},
+            }
+        ),
+        created_at="2026-07-13T00:00:00Z",
+    )
+    client = TestClient(
+        create_app(store=store, signing_key=registry_key, tokens=AuditorTokens([]))
+    )
+    served = client.get("/v1/log", params={"since": 0, "limit": 100}).json()
+    _assert_valid_envelope("log-response-v2.schema.json", served)
+    mutated = json.loads(json.dumps(served))
+    mutated["entries"][0]["entry_hash"] = "invalid"
+    _assert_invalid_envelope("log-response-v2.schema.json", mutated)
+
+
+def test_shared_service_page_boundary_vectors(tmp_path: Path) -> None:
+    vectors = _json("vectors/registry-service.json")
+    pagination = vectors["pagination"]
+    assert pagination["boundary_emitted_on_every_page"] is True
+    assert pagination["chain_boundary_byte_identical"] is True
+    records_schema = "records-response-v2.schema.json"
+    log_schema = "log-response-v2.schema.json"
+
+    registry_key = signing.generate_key()
+    store = Store(tmp_path / "boundary-registry.db")
+    # Sign the shared vector bodies so served log entries validate as
+    # audit-record-v1; the audit case markers the vectors assert on survive.
+    for item in vectors["records"]:
+        store.append(
+            registry_key.sign_record(dict(item["record"])),
+            created_at="2026-07-13T00:00:00Z",
+        )
+    client = TestClient(
+        create_app(store=store, signing_key=registry_key, tokens=AuditorTokens([]))
+    )
+
+    query = dict(pagination["query"])
+    first_response = client.get("/v1/records", params=query)
+    assert first_response.status_code == 200
+    first = first_response.json()
+    _assert_valid_envelope(records_schema, first)
+    assert [record["audit"]["case"] for record in first["records"]] == pagination[
+        "expected_pages"
+    ][0]
+    assert first["boundary"]["log_size"] == pagination["boundary_log_size"]
+    assert signing.verify_signed(registry_key.public_pinned, first["boundary"])
+    assert first["boundary"] == client.get("/v1/snapshot").json()
+    chain_boundary = signing.canonical_document_bytes(first["boundary"])
+
+    appended = pagination["append_after_first_page"]
+    store.append(
+        registry_key.sign_record(dict(appended["record"])),
+        created_at="2026-07-13T00:01:00Z",
+    )
+
+    assert isinstance(first["next_cursor"], str) and first["next_cursor"]
+    second_response = client.get(
+        "/v1/records", params={**query, "cursor": first["next_cursor"]}
+    )
+    assert second_response.status_code == 200
+    second = second_response.json()
+    _assert_valid_envelope(records_schema, second)
+    assert [record["audit"]["case"] for record in second["records"]] == pagination[
+        "expected_original_cursor_ids"
+    ]
+    assert second["next_cursor"] is None
+    assert signing.verify_signed(registry_key.public_pinned, second["boundary"])
+    assert signing.canonical_document_bytes(second["boundary"]) == chain_boundary
+
+    fresh = client.get(
+        "/v1/records",
+        params={"content_sha256": query["content_sha256"], "limit": 100},
+    ).json()
+    _assert_valid_envelope(records_schema, fresh)
+    assert [record["audit"]["case"] for record in fresh["records"]] == pagination[
+        "expected_new_query_ids"
+    ]
+    assert fresh["next_cursor"] is None
+    assert signing.verify_signed(registry_key.public_pinned, fresh["boundary"])
+    assert fresh["boundary"] == client.get("/v1/snapshot").json()
+    assert signing.canonical_document_bytes(fresh["boundary"]) != chain_boundary
+
+    log_first = client.get("/v1/log", params={"since": 0, "limit": 2}).json()
+    _assert_valid_envelope(log_schema, log_first)
+    assert signing.verify_signed(registry_key.public_pinned, log_first["boundary"])
+    assert log_first["boundary"] == client.get("/v1/snapshot").json()
+    log_chain = signing.canonical_document_bytes(log_first["boundary"])
+    entries = list(log_first["entries"])
+    body = log_first
+    while body["next_cursor"] is not None:
+        body = client.get(
+            "/v1/log",
+            params={"since": 0, "limit": 2, "cursor": body["next_cursor"]},
+        ).json()
+        _assert_valid_envelope(log_schema, body)
+        assert signing.verify_signed(registry_key.public_pinned, body["boundary"])
+        assert signing.canonical_document_bytes(body["boundary"]) == log_chain
+        entries.extend(body["entries"])
+    assert [entry["seq"] for entry in entries] == [1, 2, 3, 4, 5]
+
+
+def _resign_cursor_envelope(
+    key: signing.SigningKey, cursor: str, **overrides: Any
+) -> str:
+    """Re-sign a cursor envelope after tweaking its payload (test forgery).
+
+    The envelope signature is genuine, so a refusal proves the service
+    rejected the tampered payload itself (here: the expiry).
+    """
+    payload_text = cursor.split(".", 1)[0]
+    payload = json.loads(
+        base64.urlsafe_b64decode(payload_text + "=" * (-len(payload_text) % 4))
+    )
+    payload.update(overrides)
+    raw = signing.canonical_document_bytes(payload)
+
+    def _url64(value: bytes) -> str:
+        return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+    return f"{_url64(raw)}.{_url64(base64.b64decode(key.sign(raw)))}"
+
+
+def _flip_boundary_hex(value: str) -> str:
+    return "00" * 32 if value != "00" * 32 else "ff" * 32
+
+
+def test_shared_service_cursor_boundary_cases(tmp_path: Path) -> None:
+    vectors = _json("vectors/registry-service.json")
+    pagination = vectors["pagination"]
+    assert pagination["cursor_boundary_cases"], "no cursor_boundary_cases vectors"
+
+    registry_key = signing.generate_key()
+    store = Store(tmp_path / "cursor-boundary-registry.db")
+    for item in vectors["records"]:
+        store.append(
+            registry_key.sign_record(dict(item["record"])),
+            created_at="2026-07-13T00:00:00Z",
+        )
+    client = TestClient(
+        create_app(store=store, signing_key=registry_key, tokens=AuditorTokens([]))
+    )
+
+    query = dict(pagination["query"])
+    first = client.get("/v1/records", params=query)
+    assert first.status_code == 200
+    first_body = first.json()
+    assert isinstance(first_body["next_cursor"], str) and first_body["next_cursor"]
+    chain = signing.canonical_document_bytes(first_body["boundary"])
+    records_query = {
+        "source_identity": "",
+        "commit": "",
+        "content_sha256": query["content_sha256"],
+        "limit": query["limit"],
+    }
+
+    # The chain is not re-evaluated after an append: reuse the shared
+    # append_after_first_page flow as the control for every boundary case.
+    appended = pagination["append_after_first_page"]
+    store.append(
+        registry_key.sign_record(dict(appended["record"])),
+        created_at="2026-07-13T00:01:00Z",
+    )
+    assert client.get("/v1/snapshot").json()["log_size"] == (
+        first_body["boundary"]["log_size"] + 1
+    )
+
+    for case in pagination["cursor_boundary_cases"]:
+        assert case["name"] == "cursor-boundary-disagreement"
+        assert case["reevaluate_at_newer_boundary"] is False
+        # Control: the original cursor still serves the ORIGINAL boundary.
+        continued = client.get(
+            "/v1/records", params={**query, "cursor": first_body["next_cursor"]}
+        )
+        assert continued.status_code == 200
+        assert [record["audit"]["case"] for record in continued.json()["records"]] == (
+            pagination["expected_original_cursor_ids"]
+        )
+        assert signing.canonical_document_bytes(continued.json()["boundary"]) == chain
+        # Disagreement: a carried boundary whose body differs from the store,
+        # genuinely re-signed with the service key, is refused on /v1/records.
+        forged = dict(first_body["boundary"])
+        forged["head"] = _flip_boundary_hex(forged["head"])
+        signed_forged = registry_key.sign_record(forged)
+        assert signing.verify_signed(registry_key.public_pinned, signed_forged)
+        bad_cursor = _encode_cursor(
+            registry_key,
+            endpoint="records",
+            query=records_query,
+            boundary_snapshot=signed_forged,
+            offset=1,
+        )
+        refused = client.get("/v1/records", params={**query, "cursor": bad_cursor})
+        assert refused.status_code == case["status"] == 404
+        assert refused.json()["error"]["code"] == case["error"] == "invalid_cursor"
+        # Same refusal on /v1/log, via the Merkle root this time.
+        log_first = client.get("/v1/log", params={"since": 0, "limit": 2}).json()
+        forged_log = dict(log_first["boundary"])
+        forged_log["merkle_root"] = _flip_boundary_hex(forged_log["merkle_root"])
+        signed_log = registry_key.sign_record(forged_log)
+        assert signing.verify_signed(registry_key.public_pinned, signed_log)
+        bad_log = _encode_cursor(
+            registry_key,
+            endpoint="log",
+            query={"since": 0, "limit": 2},
+            boundary_snapshot=signed_log,
+            offset=1,
+        )
+        refused_log = client.get(
+            "/v1/log", params={"since": 0, "limit": 2, "cursor": bad_log}
+        )
+        assert refused_log.status_code == case["status"] == 404
+        assert refused_log.json()["error"]["code"] == case["error"] == "invalid_cursor"
+
+
+def test_shared_service_cursor_rejections(tmp_path: Path) -> None:
+    vectors = _json("vectors/registry-service.json")
+    pagination = vectors["pagination"]
+    assert set(pagination["cursor_rejections"]) == {
+        "changed_query",
+        "changed_limit",
+        "wrong_endpoint",
+        "expired",
+        "unavailable_snapshot",
+    }
+    assert pagination["invalid_cursor_status"] == 404
+
+    registry_key = signing.generate_key()
+    store = Store(tmp_path / "cursor-rejections-registry.db")
+    for item in vectors["records"]:
+        store.append(
+            registry_key.sign_record(dict(item["record"])),
+            created_at="2026-07-13T00:00:00Z",
+        )
+    client = TestClient(
+        create_app(store=store, signing_key=registry_key, tokens=AuditorTokens([]))
+    )
+    query = dict(pagination["query"])
+    records_first = client.get("/v1/records", params=query).json()
+    log_first = client.get("/v1/log", params={"since": 0, "limit": 2}).json()
+    records_cursor = records_first["next_cursor"]
+    log_cursor = log_first["next_cursor"]
+    assert isinstance(records_cursor, str) and records_cursor
+    assert isinstance(log_cursor, str) and log_cursor
+
+    def _refused(response: Any) -> None:
+        assert response.status_code == pagination["invalid_cursor_status"]
+        assert response.json()["error"]["code"] == "invalid_cursor"
+
+    # changed_query: the same cursor under different filters.
+    _refused(
+        client.get(
+            "/v1/records",
+            params={
+                "content_sha256": "sha256:" + "00" * 32,
+                "limit": query["limit"],
+                "cursor": records_cursor,
+            },
+        )
+    )
+    _refused(
+        client.get(
+            "/v1/log", params={"since": 1, "limit": 2, "cursor": log_cursor}
+        )
+    )
+    # changed_limit: the same cursor under a different page size.
+    _refused(
+        client.get(
+            "/v1/records",
+            params={**query, "limit": query["limit"] + 1, "cursor": records_cursor},
+        )
+    )
+    _refused(
+        client.get(
+            "/v1/log", params={"since": 0, "limit": 3, "cursor": log_cursor}
+        )
+    )
+    # wrong_endpoint: cursors do not cross endpoints.
+    _refused(
+        client.get(
+            "/v1/log", params={"since": 0, "limit": 2, "cursor": records_cursor}
+        )
+    )
+    _refused(client.get("/v1/records", params={**query, "cursor": log_cursor}))
+    # expired: genuinely re-signed envelope with a past expiry.
+    _refused(
+        client.get(
+            "/v1/records",
+            params={
+                **query,
+                "cursor": _resign_cursor_envelope(
+                    registry_key, records_cursor, expires_at=1
+                ),
+            },
+        )
+    )
+    _refused(
+        client.get(
+            "/v1/log",
+            params={
+                "since": 0,
+                "limit": 2,
+                "cursor": _resign_cursor_envelope(registry_key, log_cursor, expires_at=1),
+            },
+        )
+    )
+    # unavailable_snapshot: a carried boundary past the committed head.
+    future = dict(records_first["boundary"])
+    future["version"] = future["log_size"] = future["log_size"] + 5
+    signed_future = registry_key.sign_record(future)
+    assert signing.verify_signed(registry_key.public_pinned, signed_future)
+    _refused(
+        client.get(
+            "/v1/records",
+            params={
+                **query,
+                "cursor": _encode_cursor(
+                    registry_key,
+                    endpoint="records",
+                    query={
+                        "source_identity": "",
+                        "commit": "",
+                        "content_sha256": query["content_sha256"],
+                        "limit": query["limit"],
+                    },
+                    boundary_snapshot=signed_future,
+                    offset=1,
+                ),
+            },
+        )
+    )
+    log_future = dict(log_first["boundary"])
+    log_future["version"] = log_future["log_size"] = log_future["log_size"] + 5
+    signed_log_future = registry_key.sign_record(log_future)
+    assert signing.verify_signed(registry_key.public_pinned, signed_log_future)
+    _refused(
+        client.get(
+            "/v1/log",
+            params={
+                "since": 0,
+                "limit": 2,
+                "cursor": _encode_cursor(
+                    registry_key,
+                    endpoint="log",
+                    query={"since": 0, "limit": 2},
+                    boundary_snapshot=signed_log_future,
+                    offset=1,
+                ),
+            },
+        )
+    )
 
 
 @pytest.mark.parametrize(
