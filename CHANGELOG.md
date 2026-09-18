@@ -33,6 +33,22 @@
 
 ### Security
 
+- P4: `import-bundle` now persists a per-upstream high-water (`version`,
+  `log_size`, `head`, `merkle_root` per upstream `key_id`) in a new
+  `upstream_high_water` table (schema version 4, migrated once at startup)
+  and compares every verified bundle against it under the client §5
+  rollback rules. A version below refuses with `import_upstream_rollback`;
+  an equal version with a different `head`/`merkle_root`/`log_size` refuses
+  with `import_upstream_inconsistent`; an equal identical boundary is an
+  accepted no-op; a higher version imports and advances the stored boundary
+  in the same transaction as the imported records. Refusals exit non-zero
+  naming the upstream `key_id` and both boundaries, and the `import_bundle`
+  audit event records the compared boundaries and the outcome.
+  `--accept-older-upstream` imports an older bundle with a warning without
+  lowering the high-water; the inconsistent case is never overridable. No
+  protocol or wire change; the table ships inside `registry.db` (so
+  `backup` copies it) and is not compared by `verify-backup` (curator-spec
+  `dced9b8`, implementation detail).
 - R6: optional passphrase-protected signing key via `CSK_REGISTRY_KEY_PASSPHRASE`
   (environment only, never a CLI flag). When set, `genkey`, rotation
   staging, and rotation activation write encrypted PKCS8 PEM

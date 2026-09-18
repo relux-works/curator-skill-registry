@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, NoReturn
+from typing import Any, Iterator, Literal, NoReturn
 
 from .checkpoint import REFUSAL_DIAGNOSTICS, CheckpointView, compare_checkpoint
 from .permissions import protect_private_file
@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS merkle_frontier (
     len INTEGER NOT NULL,
     tail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS upstream_high_water (
+    key_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    log_size INTEGER NOT NULL,
+    head TEXT NOT NULL,
+    merkle_root TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 _IDEMPOTENCY_SCHEMA = """
@@ -70,8 +78,9 @@ CREATE INDEX idx_idempotency_expiry ON idempotency (expires_at);
 """
 
 _GENESIS = "0" * 64
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _SCHEMA_VERSION_V2 = 2
+_SCHEMA_VERSION_V3 = 3
 _OPERATION_DEADLINE_SECONDS = 30.0
 
 #: Default seconds between background full-verification passes. Probes served
@@ -143,6 +152,122 @@ class SnapshotBoundary:
         ):
             raise ValueError("snapshot boundary is malformed")
         return cls(version, log_size, head, merkle_root, created_at)
+
+
+@dataclass(frozen=True)
+class UpstreamHighWater:
+    """Highest accepted upstream snapshot boundary for one upstream key.
+
+    Unlike :class:`SnapshotBoundary`, ``version`` and ``log_size`` are not
+    forced equal: the bundle snapshot validates under the wire rule
+    ``log_size <= version``, and the §5 rollback comparison treats
+    ``version`` as the ordering field with ``head``/``merkle_root``/
+    ``log_size`` as the equal-version identity. ``updated_at`` is the local
+    time the high-water advanced, never the upstream ``created_at``.
+    """
+
+    key_id: str
+    version: int
+    log_size: int
+    head: str
+    merkle_root: str
+    updated_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "key_id": self.key_id,
+            "version": self.version,
+            "log_size": self.log_size,
+            "head": self.head,
+            "merkle_root": self.merkle_root,
+            "updated_at": self.updated_at,
+        }
+
+
+#: Offered upstream version is below the persisted per-upstream high-water.
+IMPORT_UPSTREAM_ROLLBACK = "import_upstream_rollback"
+#: Offered upstream version equals the high-water with a different body.
+IMPORT_UPSTREAM_INCONSISTENT = "import_upstream_inconsistent"
+
+
+class UpstreamHighWaterConflict(ValueError):
+    """The serialized high-water comparison refused an import batch.
+
+    Raised inside the write transaction when the offered boundary is below
+    the authoritative persisted high-water (or equal with a different body).
+    It carries the closed diagnostic, the upstream ``key_id``, the
+    authoritative persisted boundary and the offered boundary, so the import
+    layer can log the comparison that actually decided and re-raise its typed
+    error without re-reading state. The message names the ``key_id`` and both
+    boundaries even for direct store callers.
+    """
+
+    def __init__(
+        self,
+        diagnostic: str,
+        key_id: str,
+        persisted: UpstreamHighWater,
+        offered: UpstreamHighWater,
+    ) -> None:
+        self.diagnostic = diagnostic
+        self.key_id = key_id
+        self.persisted = persisted
+        self.offered = offered
+        if diagnostic == IMPORT_UPSTREAM_INCONSISTENT:
+            relation = (
+                f"offered version {offered.version} with a different body than persisted"
+            )
+        else:
+            relation = (
+                f"offered version {offered.version} "
+                f"below persisted version {persisted.version}"
+            )
+        super().__init__(
+            f"{diagnostic}: upstream {key_id} {relation} "
+            f"(persisted version={persisted.version} log_size={persisted.log_size} "
+            f"head={persisted.head} merkle_root={persisted.merkle_root}; "
+            f"offered version={offered.version} log_size={offered.log_size} "
+            f"head={offered.head} merkle_root={offered.merkle_root})"
+        )
+
+
+@dataclass(frozen=True)
+class UpstreamImportResult:
+    """Outcome of one serialized upstream import batch.
+
+    ``persisted`` is the authoritative high-water before-image the comparison
+    decided against (``None`` for a first import). ``outcome`` is
+    ``"advanced"`` when the batch moved the high-water, ``"noop"`` for an
+    equal identical boundary (nothing persisted), or ``"accepted_older"``
+    when an older batch imported under explicit override without lowering
+    the high-water.
+    """
+
+    imported: int
+    persisted: UpstreamHighWater | None
+    outcome: Literal["advanced", "noop", "accepted_older"]
+
+
+def _upstream_offer_diagnostic(
+    current: UpstreamHighWater, offered: UpstreamHighWater
+) -> str | None:
+    """Closed refusal diagnostic for an offered boundary, if it must refuse.
+
+    Returns ``None`` when the offered boundary is acceptable: strictly above
+    the persisted high-water (advance) or equal and identical (no-op). A
+    version below refuses with ``import_upstream_rollback``; an equal version
+    with a different ``head``/``merkle_root``/``log_size`` refuses with
+    ``import_upstream_inconsistent``.
+    """
+    if offered.version < current.version:
+        return IMPORT_UPSTREAM_ROLLBACK
+    if offered.version == current.version and (
+        offered.head != current.head
+        or offered.merkle_root != current.merkle_root
+        or offered.log_size != current.log_size
+    ):
+        return IMPORT_UPSTREAM_INCONSISTENT
+    return None
 
 
 @dataclass(frozen=True)
@@ -243,9 +368,15 @@ class Store:
                     self._mark_current_schema()
                 elif user_version == _SCHEMA_VERSION:
                     self._require_current_schema()
+                elif user_version == _SCHEMA_VERSION_V3:
+                    self._require_v3_schema()
+                    self._migrate_v3_to_v4()
+                    self._require_current_schema()
                 elif user_version == _SCHEMA_VERSION_V2:
                     self._require_v2_schema()
                     self._migrate_v2_to_v3()
+                    self._require_v3_schema()
+                    self._migrate_v3_to_v4()
                     self._require_current_schema()
                 else:
                     raise StoreIntegrityError(
@@ -398,6 +529,14 @@ class Store:
             },
             "boundaries": {"log_size", "head", "merkle_root", "created_at"},
             "merkle_frontier": {"level", "len", "tail"},
+            "upstream_high_water": {
+                "key_id",
+                "version",
+                "log_size",
+                "head",
+                "merkle_root",
+                "updated_at",
+            },
         }
         for table, expected_columns in required.items():
             if self._table_columns(table) != expected_columns:
@@ -409,6 +548,7 @@ class Store:
             "idempotency": ["auditor_id", "key"],
             "boundaries": ["log_size"],
             "merkle_frontier": ["level"],
+            "upstream_high_water": ["key_id"],
         }.items():
             actual_primary_key = [
                 str(row["name"])
@@ -478,6 +618,42 @@ class Store:
         if marker is None or marker["value"] != str(_SCHEMA_VERSION_V2):
             raise StoreIntegrityError("database schema version markers disagree")
 
+    def _require_v3_schema(self) -> None:
+        required = {
+            "log": {
+                "seq",
+                "entry_hash",
+                "prev_hash",
+                "name",
+                "source_identity",
+                "commit_hash",
+                "content_sha256",
+                "status",
+                "record_json",
+                "created_at",
+            },
+            "metadata": {"key", "value"},
+            "imported_records": {"fingerprint", "imported_at", "seq"},
+            "idempotency": {
+                "auditor_id",
+                "key",
+                "body_sha256",
+                "response_json",
+                "seq",
+                "expires_at",
+            },
+            "boundaries": {"log_size", "head", "merkle_root", "created_at"},
+            "merkle_frontier": {"level", "len", "tail"},
+        }
+        for table, expected_columns in required.items():
+            if self._table_columns(table) != expected_columns:
+                raise StoreIntegrityError(f"database schema for {table} is unsupported")
+        marker = self._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        if marker is None or marker["value"] != str(_SCHEMA_VERSION_V3):
+            raise StoreIntegrityError("database schema version markers disagree")
+
     def _migrate_v2_to_v3(self) -> None:
         with self._write_transaction():
             self._conn.execute(
@@ -488,6 +664,20 @@ class Store:
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS merkle_frontier ("
                 "level INTEGER PRIMARY KEY, len INTEGER NOT NULL, tail TEXT NOT NULL)"
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+                (str(_SCHEMA_VERSION_V3),),
+            )
+            self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION_V3}")
+
+    def _migrate_v3_to_v4(self) -> None:
+        with self._write_transaction():
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS upstream_high_water ("
+                "key_id TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+                "log_size INTEGER NOT NULL, head TEXT NOT NULL, "
+                "merkle_root TEXT NOT NULL, updated_at TEXT NOT NULL)"
             )
             self._conn.execute(
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
@@ -1068,14 +1258,67 @@ class Store:
             ).fetchall()
             return [_entry_from_row(row) for row in rows[:limit]], len(rows) > limit
 
+    def get_upstream_high_water(self, key_id: str) -> UpstreamHighWater | None:
+        """Return the persisted high-water for one upstream key, if any."""
+        with self._lock, self._operation_deadline():
+            return self._get_upstream_high_water_locked(key_id)
+
+    def _get_upstream_high_water_locked(self, key_id: str) -> UpstreamHighWater | None:
+        row = self._conn.execute(
+            "SELECT key_id, version, log_size, head, merkle_root, updated_at "
+            "FROM upstream_high_water WHERE key_id = ?",
+            (key_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return UpstreamHighWater(
+            key_id=str(row["key_id"]),
+            version=int(row["version"]),
+            log_size=int(row["log_size"]),
+            head=str(row["head"]),
+            merkle_root=str(row["merkle_root"]),
+            updated_at=str(row["updated_at"]),
+        )
+
     def append_imports(
-        self, records: list[tuple[str, dict[str, Any]]], *, created_at: str
+        self,
+        records: list[tuple[str, dict[str, Any]]],
+        *,
+        created_at: str,
+        upstream_high_water: UpstreamHighWater | None = None,
     ) -> int:
+        """Append one import batch, optionally advancing an upstream high-water.
+
+        When ``upstream_high_water`` is given, the row is written in the same
+        transaction as the imported records: a mid-batch failure rolls both
+        back, and the high-water never advances without the import committing.
+        Callers that must leave the high-water untouched (identical re-import,
+        ``--accept-older-upstream``) pass ``None``. A concurrent import that
+        advanced the high-water past the offered boundary fails the whole
+        transaction with the closed diagnostic instead of lowering it.
+        Prefer :meth:`append_upstream_import`, which additionally carries the
+        override policy and reports the authoritative outcome.
+        """
         imported = 0
         last_entry: LogEntry | None = None
         with self._lock, self._operation_deadline():
             with self._write_transaction():
                 self._require_writes_allowed()
+                if upstream_high_water is not None:
+                    current = self._get_upstream_high_water_locked(
+                        upstream_high_water.key_id
+                    )
+                    if current is not None:
+                        diagnostic = _upstream_offer_diagnostic(
+                            current, upstream_high_water
+                        )
+                        if diagnostic is not None:
+                            raise UpstreamHighWaterConflict(
+                                diagnostic,
+                                upstream_high_water.key_id,
+                                current,
+                                upstream_high_water,
+                            )
                 for fingerprint, record in records:
                     exists = self._conn.execute(
                         "SELECT 1 FROM imported_records WHERE fingerprint = ?",
@@ -1091,6 +1334,20 @@ class Store:
                     )
                     imported += 1
                     last_entry = entry
+                if upstream_high_water is not None:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO upstream_high_water "
+                        "(key_id, version, log_size, head, merkle_root, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            upstream_high_water.key_id,
+                            upstream_high_water.version,
+                            upstream_high_water.log_size,
+                            upstream_high_water.head,
+                            upstream_high_water.merkle_root,
+                            upstream_high_water.updated_at,
+                        ),
+                    )
             # Publish only after COMMIT: the whole batch is atomic, so the
             # verdict jumps to the last durable entry or stays put (see
             # :meth:`append`). A mid-batch failure rolls everything back and
@@ -1099,6 +1356,91 @@ class Store:
                 self._health_verified_head = last_entry.entry_hash
                 self._health_verified_log_size = last_entry.seq
         return imported
+
+    def append_upstream_import(
+        self,
+        records: list[tuple[str, dict[str, Any]]],
+        *,
+        created_at: str,
+        offered: UpstreamHighWater,
+        accept_older_upstream: bool = False,
+    ) -> UpstreamImportResult:
+        """Compare one import batch against the high-water and append it.
+
+        The comparison is authoritative: it runs inside the serialized write
+        transaction (``BEGIN IMMEDIATE``), against the latest committed
+        high-water for ``offered.key_id``, so a concurrent import that
+        commits first decides the outcome — never a stale pre-transaction
+        read. The full import contract applies: a version below refuses with
+        :class:`UpstreamHighWaterConflict` carrying ``import_upstream_rollback``
+        (or imports without lowering under ``accept_older_upstream``); an
+        equal version with a different body refuses with
+        ``import_upstream_inconsistent`` and is never overridable; an equal
+        identical boundary is a no-op that persists nothing; a higher version
+        (or a first import) advances the high-water in the same transaction
+        as the imported records. Any refusal or mid-batch failure rolls the
+        whole transaction back.
+        """
+        imported = 0
+        last_entry: LogEntry | None = None
+        with self._lock, self._operation_deadline():
+            with self._write_transaction():
+                self._require_writes_allowed()
+                current = self._get_upstream_high_water_locked(offered.key_id)
+                advance = True
+                outcome: Literal["advanced", "noop", "accepted_older"] = "advanced"
+                if current is not None:
+                    diagnostic = _upstream_offer_diagnostic(current, offered)
+                    if diagnostic is not None:
+                        if (
+                            diagnostic == IMPORT_UPSTREAM_ROLLBACK
+                            and accept_older_upstream
+                        ):
+                            outcome = "accepted_older"
+                            advance = False
+                        else:
+                            raise UpstreamHighWaterConflict(
+                                diagnostic, offered.key_id, current, offered
+                            )
+                    elif offered.version == current.version:
+                        outcome = "noop"
+                        advance = False
+                for fingerprint, record in records:
+                    exists = self._conn.execute(
+                        "SELECT 1 FROM imported_records WHERE fingerprint = ?",
+                        (fingerprint,),
+                    ).fetchone()
+                    if exists is not None:
+                        continue
+                    entry = self._append_locked(record, created_at=created_at)
+                    self._conn.execute(
+                        "INSERT INTO imported_records (fingerprint, imported_at, seq) "
+                        "VALUES (?, ?, ?)",
+                        (fingerprint, created_at, entry.seq),
+                    )
+                    imported += 1
+                    last_entry = entry
+                if advance:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO upstream_high_water "
+                        "(key_id, version, log_size, head, merkle_root, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            offered.key_id,
+                            offered.version,
+                            offered.log_size,
+                            offered.head,
+                            offered.merkle_root,
+                            offered.updated_at,
+                        ),
+                    )
+            # Publish only after COMMIT (see :meth:`append_imports`).
+            if last_entry is not None:
+                self._health_verified_head = last_entry.entry_hash
+                self._health_verified_log_size = last_entry.seq
+        return UpstreamImportResult(
+            imported=imported, persisted=current, outcome=outcome
+        )
 
     def head(self) -> tuple[int, str]:
         boundary = self.snapshot_boundary()
@@ -1347,6 +1689,34 @@ class Store:
                 record = None
             if _import_fingerprint(record) != row["fingerprint"]:
                 errors.append(f"import fingerprint {row['fingerprint']!r} is inconsistent")
+
+        for row in conn.execute(
+            "SELECT key_id, version, log_size, head, merkle_root, updated_at "
+            "FROM upstream_high_water"
+        ):
+            version = row["version"]
+            log_size = row["log_size"]
+            if (
+                not isinstance(row["key_id"], str)
+                or len(row["key_id"]) != 16
+                or any(c not in "0123456789abcdef" for c in row["key_id"])
+                or not isinstance(version, int)
+                or isinstance(version, bool)
+                or not isinstance(log_size, int)
+                or isinstance(log_size, bool)
+                or version < 0
+                or log_size < 0
+                or log_size > version
+                or not isinstance(row["head"], str)
+                or not _hex256(str(row["head"]))
+                or not isinstance(row["merkle_root"], str)
+                or not _hex256(str(row["merkle_root"]))
+                or not isinstance(row["updated_at"], str)
+                or not _timestamp(str(row["updated_at"]))
+            ):
+                errors.append(
+                    f"upstream high-water {row['key_id']!r} is malformed"
+                )
         return errors, leaves
 
     def _health_stale_locked(self, now: float) -> bool:

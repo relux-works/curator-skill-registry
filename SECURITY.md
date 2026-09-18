@@ -55,6 +55,17 @@ carried boundary, and a carried boundary that disagrees with the committed
 log or is no longer available is refused with `404 invalid_cursor` rather
 than re-evaluated at a newer boundary.
 
+Upstream import is fail-closed against rollback: `import-bundle` persists a
+per-upstream high-water (the highest accepted upstream `version`, with
+`log_size`, `head`, and `merkle_root`) in `registry.db` and refuses an old
+but validly signed bundle as `import_upstream_rollback`, or an equal version
+with a different body as `import_upstream_inconsistent`, instead of
+re-importing it as new. Only an explicit `--accept-older-upstream` imports
+an older bundle, with a warning and without lowering the stored high-water;
+the inconsistent case is never overridable. Without this, an attacker
+replaying a stale upstream bundle could resurrect revoked or superseded
+records as fresh imports.
+
 Health is fail-closed too: `GET /health` serves a cached integrity verdict
 that a background full verifier refreshes on a bounded interval, and any
 failed pass (corruption found or the walk itself failing) latches non-ready

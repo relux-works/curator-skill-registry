@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -2029,6 +2030,7 @@ def test_v2_database_migrates_and_backfills_boundaries(tmp_path: Path) -> None:
     try:
         connection.execute("DROP TABLE boundaries")
         connection.execute("DROP TABLE merkle_frontier")
+        connection.execute("DROP TABLE upstream_high_water")
         connection.execute("UPDATE metadata SET value = '2' WHERE key = 'schema_version'")
         connection.execute("PRAGMA user_version=2")
         connection.commit()
@@ -2040,9 +2042,9 @@ def test_v2_database_migrates_and_backfills_boundaries(tmp_path: Path) -> None:
         marker = upgraded._conn.execute(  # type: ignore[attr-defined]
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert marker["value"] == "3"
+        assert marker["value"] == "4"
         version = upgraded._conn.execute("PRAGMA user_version").fetchone()[0]  # type: ignore[attr-defined]
-        assert int(version) == 3
+        assert int(version) == 4
         for size, root in enumerate(expected, start=1):
             assert upgraded.snapshot_boundary(size).merkle_root == root
         upgraded.append(
@@ -2849,3 +2851,689 @@ def test_frontier_tampering_rebuilds_and_next_append_stays_correct(
         )
     finally:
         reopened.close()
+
+
+# Upstream high-water (P4): per-upstream rollback refusal for import-bundle.
+
+
+def _upstream_pair(tmp_path: Path) -> tuple[object, object, dict, dict]:
+    """Build one upstream history and return (up_key, down_key, v1, v2)."""
+    from csk_registry.bundle import export_bundle
+
+    upstream = Store(tmp_path / "up.db")
+    up_key = signing.generate_key()
+    upstream.append(
+        up_key.sign_record(_body("audited", name="skill-a")),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_v1 = export_bundle(upstream, up_key)
+    upstream.append(
+        up_key.sign_record(
+            _body("audited", name="skill-b", commit="1" * 40, content_sha256="sha256:" + "2f" * 32)
+        ),
+        created_at="2026-07-07T01:00:00Z",
+    )
+    bundle_v2 = export_bundle(upstream, up_key)
+    upstream.close()
+    return up_key, signing.generate_key(), bundle_v1, bundle_v2  # type: ignore[return-value]
+
+
+def test_first_import_establishes_upstream_high_water(tmp_path: Path) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, _ = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert downstream.get_upstream_high_water(up_key.key_id) is None  # type: ignore[attr-defined,union-attr]
+    assert (
+        import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert high_water is not None
+    assert high_water.version == bundle_v1["snapshot"]["version"] == 1
+    assert high_water.log_size == bundle_v1["snapshot"]["log_size"] == 1
+    assert high_water.head == bundle_v1["snapshot"]["head"]
+    assert high_water.merkle_root == bundle_v1["snapshot"]["merkle_root"]
+
+
+def test_import_rollback_bundle_refused(tmp_path: Path) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2 = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 2
+    )
+    before = downstream.head()[0]
+    with pytest.raises(ValueError, match="import_upstream_rollback"):
+        import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+    try:
+        import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+    except ValueError as exc:
+        message = str(exc)
+        assert "import_upstream_rollback" in message
+        assert up_key.key_id in message  # type: ignore[union-attr]
+        assert bundle_v1["snapshot"]["head"] in message
+        assert bundle_v2["snapshot"]["head"] in message
+    else:  # pragma: no cover
+        raise AssertionError("rollback bundle was accepted")
+    high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert high_water is not None and high_water.version == 2
+    assert downstream.head()[0] == before
+
+
+def test_import_inconsistent_bundle_refused_even_with_flag(tmp_path: Path) -> None:
+    from csk_registry.bundle import export_bundle, import_bundle
+
+    upstream = Store(tmp_path / "up.db")
+    up_key = signing.generate_key()
+    upstream.append(
+        up_key.sign_record(_body("audited", name="skill-a")),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_a = export_bundle(upstream, up_key)
+    upstream.close()
+    fork = Store(tmp_path / "fork.db")
+    fork.append(
+        up_key.sign_record(
+            _body("audited", name="skill-fork", commit="2" * 40, content_sha256="sha256:" + "3f" * 32)
+        ),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_fork = export_bundle(fork, up_key)
+    fork.close()
+    assert bundle_a["snapshot"]["version"] == bundle_fork["snapshot"]["version"] == 1
+    assert bundle_a["snapshot"]["head"] != bundle_fork["snapshot"]["head"]
+
+    downstream = Store(tmp_path / "down.db")
+    down_key = signing.generate_key()
+    assert import_bundle(downstream, down_key, bundle_a, upstream_public_key=up_key.public_pinned) == 1
+    for accept_older in (False, True):
+        with pytest.raises(ValueError, match="import_upstream_inconsistent"):
+            import_bundle(
+                downstream,
+                down_key,
+                bundle_fork,
+                upstream_public_key=up_key.public_pinned,
+                accept_older_upstream=accept_older,
+            )
+    high_water = downstream.get_upstream_high_water(up_key.key_id)
+    assert high_water is not None and high_water.head == bundle_a["snapshot"]["head"]
+    assert downstream.head()[0] == 1
+
+
+def test_identical_reimport_is_noop(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from csk_registry import bundle as bundle_module
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, _, bundle_v2 = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 2
+    )
+    before = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    # Freeze a distinct re-import timestamp: a rewrite of the high-water row
+    # would stamp it, so row equality below proves nothing was persisted
+    # (utc_now has one-second resolution and same-second imports would
+    # otherwise collide).
+    monkeypatch.setattr(bundle_module, "utc_now", lambda: "2030-01-01T00:00:00Z")
+    with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+        assert (
+            import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+            == 0
+        )
+    after = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert before == after
+    assert downstream.head()[0] == 2
+    events = [
+        json.loads(record.message)
+        for record in caplog.records
+        if "import_bundle" in record.message
+    ]
+    assert events and events[-1]["result"] == "noop"
+    assert events[-1]["offered"]["version"] == 2
+    assert events[-1]["persisted"]["version"] == 2
+
+
+def test_newer_bundle_advances_high_water(tmp_path: Path) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2 = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    assert downstream.get_upstream_high_water(up_key.key_id).version == 1  # type: ignore[union-attr]
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert high_water is not None and high_water.version == 2
+    assert high_water.head == bundle_v2["snapshot"]["head"]
+    assert downstream.head()[0] == 2
+
+
+def test_accept_older_upstream_imports_without_lowering(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from csk_registry.bundle import export_bundle, import_bundle
+
+    up_key, down_key, _, bundle_v2 = _upstream_pair(tmp_path)
+    fork = Store(tmp_path / "fork.db")
+    fork.append(
+        up_key.sign_record(  # type: ignore[union-attr]
+            _body("audited", name="skill-fork", commit="9" * 40, content_sha256="sha256:" + "9f" * 32)
+        ),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_old_fork = export_bundle(fork, up_key)  # type: ignore[arg-type]
+    fork.close()
+    assert bundle_old_fork["snapshot"]["version"] == 1
+
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 2
+    )
+    with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+        count = import_bundle(
+            downstream,
+            down_key,  # type: ignore[arg-type]
+            bundle_old_fork,
+            upstream_public_key=up_key.public_pinned,  # type: ignore[union-attr]
+            accept_older_upstream=True,
+        )
+    assert count == 1
+    high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert high_water is not None and high_water.version == 2
+    assert high_water.head == bundle_v2["snapshot"]["head"]
+    events = [
+        json.loads(record.message)
+        for record in caplog.records
+        if "import_bundle" in record.message
+    ]
+    assert events and events[-1]["warning"] == "import_upstream_rollback"
+    assert events[-1]["accepted_older"] is True
+    assert events[-1]["persisted"]["version"] == 2
+    assert events[-1]["offered"]["version"] == 1
+
+
+def test_failed_import_leaves_high_water_untouched(tmp_path: Path) -> None:
+    import copy
+
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2 = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    # Chain break: swap the two records so per-record signatures still verify
+    # but the head no longer matches the snapshot.
+    tampered = copy.deepcopy(bundle_v2)
+    tampered["records"] = [tampered["records"][1], tampered["records"][0]]
+    with pytest.raises(ValueError, match="head or size|Merkle"):
+        import_bundle(downstream, down_key, tampered, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+    high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert high_water is not None and high_water.version == 1
+    assert downstream.head()[0] == 1
+    # The untampered newer bundle still imports and advances afterwards.
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    assert downstream.get_upstream_high_water(up_key.key_id).version == 2  # type: ignore[union-attr]
+
+
+def test_failed_append_rolls_back_high_water_advance(tmp_path: Path) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2 = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    downstream._conn.execute(  # type: ignore[attr-defined]
+        "CREATE TRIGGER fail_import BEFORE INSERT ON log "
+        "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+    )
+    with pytest.raises(Exception, match="injected failure"):
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+    high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+    assert high_water is not None and high_water.version == 1
+    assert downstream.head()[0] == 1
+    downstream._conn.execute("DROP TRIGGER fail_import")  # type: ignore[attr-defined]
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 1
+    )
+    assert downstream.get_upstream_high_water(up_key.key_id).version == 2  # type: ignore[union-attr]
+
+
+def test_upstream_high_water_is_per_key(tmp_path: Path) -> None:
+    from csk_registry.bundle import export_bundle, import_bundle
+
+    upstream_a = Store(tmp_path / "a.db")
+    key_a = signing.generate_key()
+    upstream_a.append(
+        key_a.sign_record(_body("audited", name="skill-a")),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    upstream_a.append(
+        key_a.sign_record(
+            _body("audited", name="skill-a2", commit="1" * 40, content_sha256="sha256:" + "2f" * 32)
+        ),
+        created_at="2026-07-07T01:00:00Z",
+    )
+    bundle_a2 = export_bundle(upstream_a, key_a)
+    upstream_a.close()
+    upstream_b = Store(tmp_path / "b.db")
+    key_b = signing.generate_key()
+    upstream_b.append(
+        key_b.sign_record(_body("audited", name="skill-b")),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_b1 = export_bundle(upstream_b, key_b)
+    upstream_b.close()
+
+    downstream = Store(tmp_path / "down.db")
+    down_key = signing.generate_key()
+    assert import_bundle(downstream, down_key, bundle_a2, upstream_public_key=key_a.public_pinned) == 2
+    # An older version from another upstream is a first import, not a rollback.
+    assert import_bundle(downstream, down_key, bundle_b1, upstream_public_key=key_b.public_pinned) == 1
+    assert downstream.get_upstream_high_water(key_a.key_id) is not None
+    assert downstream.get_upstream_high_water(key_a.key_id).version == 2  # type: ignore[union-attr]
+    assert downstream.get_upstream_high_water(key_b.key_id) is not None
+    assert downstream.get_upstream_high_water(key_b.key_id).version == 1  # type: ignore[union-attr]
+
+
+def test_import_bundle_cli_flag_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    up_key, _, bundle_v1, bundle_v2 = _upstream_pair(tmp_path)
+    home = tmp_path / "home"
+    assert main(["--home", str(home), "genkey"]) == 0
+    newer_path = tmp_path / "newer.json"
+    older_path = tmp_path / "older.json"
+    newer_path.write_text(json.dumps(bundle_v2), encoding="utf-8")
+    older_path.write_text(json.dumps(bundle_v1), encoding="utf-8")
+    assert (
+        main(
+            ["--home", str(home), "import-bundle", str(newer_path), "--upstream-key", up_key.public_pinned]  # type: ignore[union-attr]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            ["--home", str(home), "import-bundle", str(older_path), "--upstream-key", up_key.public_pinned]  # type: ignore[union-attr]
+        )
+        == 1
+    )
+    _, err = capsys.readouterr()
+    assert "import_upstream_rollback" in err
+    assert up_key.key_id in err  # type: ignore[union-attr]
+    assert (
+        main(
+            [
+                "--home",
+                str(home),
+                "import-bundle",
+                str(older_path),
+                "--upstream-key",
+                up_key.public_pinned,  # type: ignore[union-attr]
+                "--accept-older-upstream",
+            ]
+        )
+        == 0
+    )
+    _, err_flag = capsys.readouterr()
+    assert "warning" in err_flag.lower()
+    assert "import_upstream_rollback" in err_flag
+    downstream = Store(home / "registry.db")
+    try:
+        assert downstream.get_upstream_high_water(up_key.key_id).version == 2  # type: ignore[union-attr]
+    finally:
+        downstream.close()
+
+
+def test_v3_database_migrates_to_v4_preserving_log(tmp_path: Path) -> None:
+    path = tmp_path / "v3.db"
+    store = Store(path)
+    key = signing.generate_key()
+    store.append(
+        key.sign_record(_body(name="skill-0")),
+        created_at="2026-07-13T00:00:00Z",
+    )
+    store.close()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE upstream_high_water")
+        connection.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version=3")
+        connection.commit()
+    finally:
+        connection.close()
+    upgraded = Store(path)
+    try:
+        marker = upgraded._conn.execute(  # type: ignore[attr-defined]
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert marker["value"] == "4"
+        assert int(upgraded._conn.execute("PRAGMA user_version").fetchone()[0]) == 4  # type: ignore[attr-defined]
+        assert upgraded.head()[0] == 1
+        assert upgraded.get_upstream_high_water("0" * 16) is None
+        upgraded.append(
+            key.sign_record(_body(name="skill-1")),
+            created_at="2026-07-13T00:00:01Z",
+        )
+        assert upgraded.head()[0] == 2
+    finally:
+        upgraded.close()
+
+
+def test_backup_preserves_upstream_high_water(tmp_path: Path) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, _, bundle_v2 = _upstream_pair(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    assert (
+        import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        == 2
+    )
+    downstream.backup_to(tmp_path / "backup.db")
+    downstream.close()
+    backup = Store(tmp_path / "backup.db")
+    try:
+        high_water = backup.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+        assert high_water is not None and high_water.version == 2
+        assert high_water.head == bundle_v2["snapshot"]["head"]
+    finally:
+        backup.close()
+
+
+# Competing-writer high-water races (P4 revision 2): the authoritative
+# comparison inside the serialized write transaction must carry the closed
+# diagnostics, the override policy and the audit event.
+
+
+def _upstream_triple(tmp_path: Path) -> tuple[object, object, dict, dict, dict]:
+    """Build one upstream history and return (up_key, down_key, v1, v2, v3)."""
+    from csk_registry.bundle import export_bundle
+
+    upstream = Store(tmp_path / "up3.db")
+    up_key = signing.generate_key()
+    upstream.append(
+        up_key.sign_record(_body("audited", name="skill-a")),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_v1 = export_bundle(upstream, up_key)
+    upstream.append(
+        up_key.sign_record(
+            _body("audited", name="skill-b", commit="1" * 40, content_sha256="sha256:" + "2f" * 32)
+        ),
+        created_at="2026-07-07T01:00:00Z",
+    )
+    bundle_v2 = export_bundle(upstream, up_key)
+    upstream.append(
+        up_key.sign_record(
+            _body("audited", name="skill-c", commit="3" * 40, content_sha256="sha256:" + "4f" * 32)
+        ),
+        created_at="2026-07-07T02:00:00Z",
+    )
+    bundle_v3 = export_bundle(upstream, up_key)
+    upstream.close()
+    return up_key, signing.generate_key(), bundle_v1, bundle_v2, bundle_v3  # type: ignore[return-value]
+
+
+def _pause_outer_import_at_write(
+    monkeypatch: pytest.MonkeyPatch,
+    outer: Store,
+    competitor_thunk: Callable[[], object],
+) -> None:
+    """Model the legal interleaving where a competitor commits first.
+
+    The outer import runs its real verification path, then pauses at its
+    serialized write: the competitor thunk (a real second ``Store``
+    connection importing through the real ``import_bundle`` entry point)
+    commits fully, and only then does the outer write run unchanged. The
+    authoritative comparison inside the transaction therefore decides against
+    the competitor's committed state. Deterministic: no threads, no sleeps.
+    """
+    original = outer.append_upstream_import
+
+    def raced(*args: object, **kwargs: object) -> object:
+        competitor_thunk()
+        return original(*args, **kwargs)  # type: ignore[arg-type,misc]
+
+    monkeypatch.setattr(outer, "append_upstream_import", raced)
+
+
+def _import_events(caplog: pytest.LogCaptureFixture) -> list[dict]:
+    return [
+        json.loads(record.message)
+        for record in caplog.records
+        if "import_bundle" in record.message
+    ]
+
+
+def test_concurrent_newer_first_refuses_outer_with_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2, bundle_v3 = _upstream_triple(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    competitor = Store(tmp_path / "down.db")
+    try:
+        assert (
+            import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+            == 1
+        )
+        competitor_state: dict[str, object] = {}
+
+        def commit_v3_first() -> None:
+            assert (
+                import_bundle(competitor, down_key, bundle_v3, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+                == 2
+            )
+            competitor_state["high_water"] = competitor.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+            competitor_state["head"] = competitor.head()
+
+        _pause_outer_import_at_write(monkeypatch, downstream, commit_v3_first)
+        with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+            with pytest.raises(ValueError, match="import_upstream_rollback") as exc_info:
+                import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+        message = str(exc_info.value)
+        assert up_key.key_id in message  # type: ignore[union-attr]
+        assert bundle_v3["snapshot"]["head"] in message  # persisted (competitor's v3)
+        assert bundle_v2["snapshot"]["head"] in message  # offered (outer v2)
+        events = _import_events(caplog)
+        assert events and events[-1]["result"] == "refused"
+        assert events[-1]["diagnostic"] == "import_upstream_rollback"
+        assert events[-1]["persisted"]["version"] == 3
+        assert events[-1]["offered"]["version"] == 2
+        assert events[-1]["persisted"]["head"] == bundle_v3["snapshot"]["head"]
+        # The refused outer import persisted nothing at all.
+        assert downstream.get_upstream_high_water(up_key.key_id) == competitor_state["high_water"]  # type: ignore[union-attr]
+        assert downstream.head() == competitor_state["head"]
+    finally:
+        downstream.close()
+        competitor.close()
+
+
+def test_concurrent_older_with_flag_warns_without_lowering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2, bundle_v3 = _upstream_triple(tmp_path)
+    downstream = Store(tmp_path / "down.db")
+    competitor = Store(tmp_path / "down.db")
+    try:
+        assert (
+            import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+            == 1
+        )
+
+        def commit_v3_first() -> None:
+            assert (
+                import_bundle(competitor, down_key, bundle_v3, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+                == 2
+            )
+
+        _pause_outer_import_at_write(monkeypatch, downstream, commit_v3_first)
+        with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+            count = import_bundle(
+                downstream,
+                down_key,  # type: ignore[arg-type]
+                bundle_v2,
+                upstream_public_key=up_key.public_pinned,  # type: ignore[union-attr]
+                accept_older_upstream=True,
+            )
+        # Accepted under override; v2's records were already imported as part
+        # of v3, so fingerprint dedup yields zero new rows.
+        assert count == 0
+        high_water = downstream.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+        assert high_water is not None and high_water.version == 3
+        assert high_water.head == bundle_v3["snapshot"]["head"]
+        assert downstream.head()[0] == 3
+        events = _import_events(caplog)
+        assert events and events[-1]["result"] == "ok"
+        assert events[-1]["warning"] == "import_upstream_rollback"
+        assert events[-1]["accepted_older"] is True
+        assert events[-1]["persisted"]["version"] == 3
+        assert events[-1]["offered"]["version"] == 2
+    finally:
+        downstream.close()
+        competitor.close()
+
+
+@pytest.mark.parametrize("accept_older", [False, True])
+def test_concurrent_first_imports_with_different_bodies_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    accept_older: bool,
+) -> None:
+    from csk_registry.bundle import export_bundle, import_bundle
+
+    upstream = Store(tmp_path / "up.db")
+    up_key = signing.generate_key()
+    upstream.append(
+        up_key.sign_record(_body("audited", name="skill-a")),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_a = export_bundle(upstream, up_key)
+    upstream.close()
+    fork = Store(tmp_path / "fork.db")
+    fork.append(
+        up_key.sign_record(
+            _body("audited", name="skill-fork", commit="2" * 40, content_sha256="sha256:" + "3f" * 32)
+        ),
+        created_at="2026-07-07T00:00:00Z",
+    )
+    bundle_fork = export_bundle(fork, up_key)
+    fork.close()
+    assert bundle_a["snapshot"]["version"] == bundle_fork["snapshot"]["version"] == 1
+    assert bundle_a["snapshot"]["head"] != bundle_fork["snapshot"]["head"]
+
+    downstream = Store(tmp_path / "down.db")
+    competitor = Store(tmp_path / "down.db")
+    try:
+        down_key = signing.generate_key()
+        competitor_state: dict[str, object] = {}
+
+        def commit_fork_first() -> None:
+            assert import_bundle(competitor, down_key, bundle_fork, upstream_public_key=up_key.public_pinned) == 1
+            competitor_state["high_water"] = competitor.get_upstream_high_water(up_key.key_id)
+            competitor_state["head"] = competitor.head()
+
+        _pause_outer_import_at_write(monkeypatch, downstream, commit_fork_first)
+        with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+            with pytest.raises(ValueError, match="import_upstream_inconsistent") as exc_info:
+                import_bundle(
+                    downstream,
+                    down_key,
+                    bundle_a,
+                    upstream_public_key=up_key.public_pinned,
+                    accept_older_upstream=accept_older,
+                )
+        message = str(exc_info.value)
+        assert up_key.key_id in message
+        assert bundle_fork["snapshot"]["head"] in message  # persisted (competitor's v1)
+        assert bundle_a["snapshot"]["head"] in message  # offered (outer v1)
+        events = _import_events(caplog)
+        assert events and events[-1]["result"] == "refused"
+        assert events[-1]["diagnostic"] == "import_upstream_inconsistent"
+        assert events[-1]["persisted"]["head"] == bundle_fork["snapshot"]["head"]
+        assert events[-1]["offered"]["head"] == bundle_a["snapshot"]["head"]
+        # Never overridable: the competitor's committed first import stands,
+        # byte-identical, and the outer import persisted nothing.
+        assert downstream.get_upstream_high_water(up_key.key_id) == competitor_state["high_water"]
+        assert downstream.head() == competitor_state["head"]
+    finally:
+        downstream.close()
+        competitor.close()
+
+
+def test_concurrent_identical_import_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from csk_registry import bundle as bundle_module
+    from csk_registry.bundle import import_bundle
+
+    up_key, down_key, bundle_v1, bundle_v2, _ = _upstream_triple(tmp_path)
+    # Distinct import timestamps: the competitor's committed row carries the
+    # second stamp, so any rewrite by the outer import (third stamp) would
+    # show up in the row comparison below.
+    stamps = iter(
+        [
+            "2026-07-07T10:00:00Z",  # outer v1 import
+            "2026-07-07T11:00:00Z",  # competitor v2 import
+            "2026-07-07T12:00:00Z",  # outer v2 import
+        ]
+    )
+    monkeypatch.setattr(bundle_module, "utc_now", lambda: next(stamps))
+    downstream = Store(tmp_path / "down.db")
+    competitor = Store(tmp_path / "down.db")
+    try:
+        assert (
+            import_bundle(downstream, down_key, bundle_v1, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+            == 1
+        )
+        competitor_state: dict[str, object] = {}
+
+        def commit_v2_first() -> None:
+            assert (
+                import_bundle(competitor, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+                == 1
+            )
+            competitor_state["high_water"] = competitor.get_upstream_high_water(up_key.key_id)  # type: ignore[union-attr]
+            competitor_state["head"] = competitor.head()
+
+        _pause_outer_import_at_write(monkeypatch, downstream, commit_v2_first)
+        with caplog.at_level(logging.INFO, logger="csk_registry.audit"):
+            assert (
+                import_bundle(downstream, down_key, bundle_v2, upstream_public_key=up_key.public_pinned)  # type: ignore[arg-type,union-attr]
+                == 0
+            )
+        # No-op under competition: the high-water row (including updated_at)
+        # and the log are exactly the competitor's committed state.
+        assert downstream.get_upstream_high_water(up_key.key_id) == competitor_state["high_water"]  # type: ignore[union-attr]
+        assert downstream.head() == competitor_state["head"]
+        events = _import_events(caplog)
+        assert events and events[-1]["result"] == "noop"
+        assert events[-1]["persisted"]["version"] == 2
+        assert events[-1]["offered"]["version"] == 2
+    finally:
+        downstream.close()
+        competitor.close()

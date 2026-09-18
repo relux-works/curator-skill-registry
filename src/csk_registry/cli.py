@@ -12,7 +12,11 @@ from pathlib import Path
 
 from . import CHECKPOINT_ENV, COMMAND_NAME, HEALTH_VERIFY_INTERVAL_ENV, HOME_ENV, home_from_env
 from .auth import Auditor, AuditorTokens
-from .bundle import export_bundle, import_bundle
+from .bundle import (
+    IMPORT_UPSTREAM_ROLLBACK,
+    export_bundle,
+    import_bundle,
+)
 from .clock import utc_now
 from .keys import (
     KeyPassphraseError,
@@ -234,19 +238,46 @@ def _cmd_export_bundle(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ensure_import_audit_sink() -> None:
+    """Attach the structured audit sink so import outcomes reach stderr."""
+    import logging
+
+    audit = logging.getLogger("csk_registry.audit")
+    if audit.level == logging.NOTSET or audit.level > logging.INFO:
+        audit.setLevel(logging.INFO)
+    if not audit.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit.addHandler(handler)
+
+
 def _cmd_import_bundle(args: argparse.Namespace) -> int:
     home = _home(args)
     key = load_active_key(home)
     store = Store(home / "registry.db")
+    _ensure_import_audit_sink()
     bundle = load_json(Path(args.bundle).read_bytes())
     if not isinstance(bundle, dict):
         print("import failed: bundle must be a JSON object", file=sys.stderr)
         return 1
     try:
-        count = import_bundle(store, key, bundle, upstream_public_key=args.upstream_key)
+        count = import_bundle(
+            store,
+            key,
+            bundle,
+            upstream_public_key=args.upstream_key,
+            accept_older_upstream=args.accept_older_upstream,
+        )
     except ValueError as exc:
         print(f"import failed: {exc}", file=sys.stderr)
         return 1
+    if args.accept_older_upstream:
+        print(
+            f"warning: {IMPORT_UPSTREAM_ROLLBACK} override flag was given; "
+            "an older bundle imports without lowering the persisted high-water",
+            file=sys.stderr,
+        )
     print(json.dumps({"imported": count}, indent=2))
     return 0
 
@@ -436,6 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     import_b = sub.add_parser("import-bundle", help="import and countersign an upstream bundle")
     import_b.add_argument("bundle", help="path to the exported bundle JSON")
     import_b.add_argument("--upstream-key", required=True, help="upstream registry public key (ed25519:base64)")
+    import_b.add_argument(
+        "--accept-older-upstream",
+        action="store_true",
+        help=(
+            "import a bundle below the persisted upstream high-water with a "
+            "warning, without lowering it (same-version-different-body stays refused)"
+        ),
+    )
     import_b.set_defaults(func=_cmd_import_bundle)
 
     verify_chain = sub.add_parser("verify-chain", help="verify the transparency log hash chain")

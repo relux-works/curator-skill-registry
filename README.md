@@ -32,7 +32,10 @@ Ed25519 keys before trusting it.
   serialized durable transaction. Startup fails closed on chain or ledger
   corruption.
 - Offline bundles are accepted only after signatures, log chain, head, size,
-  and Merkle root all match the pinned upstream snapshot.
+  and Merkle root all match the pinned upstream snapshot, and only when the
+  upstream snapshot is not below the persisted per-upstream high-water for
+  that upstream key (a rollback refuses; `--accept-older-upstream` imports
+  it with a warning without lowering the stored high-water).
 
 ## Run
 
@@ -83,6 +86,7 @@ curator-skill-registry --home ./data sign-record       # sign a record body from
 curator-skill-registry --home ./data export-snapshot   # print a signed snapshot
 curator-skill-registry --home ./data export-bundle     # export a signed bundle of all records
 curator-skill-registry --home ./data import-bundle <f> --upstream-key <k>  # import a bundle
+curator-skill-registry --home ./data import-bundle <f> --upstream-key <k> --accept-older-upstream  # import below the high-water with a warning
 curator-skill-registry --home ./data verify-chain      # verify the log hash chain
 curator-skill-registry --home ./data backup \
   --out /backups/registry.db --checkpoint-out /backups/registry-snapshot.json
@@ -96,6 +100,26 @@ restoring, run `verify-backup` against that external high-water checkpoint; an
 older or equivocal database is refused. Stop all writers before replacing the
 live database. Signing keys and `auditors.json` are backed up separately using
 encrypted, access-controlled secret storage.
+
+### Upstream import high-water
+
+`import-bundle` persists, per upstream public key (`key_id` of
+`--upstream-key`), the highest accepted upstream snapshot boundary
+(`version`, `log_size`, `head`, `merkle_root`) in the `upstream_high_water`
+table inside `registry.db`, updated in the same transaction as the imported
+records. The first import from an unknown upstream establishes it. Later
+imports compare under the client §5 rollback rules: a version below refuses
+with `import_upstream_rollback`; an equal version with a different `head`,
+`merkle_root`, or `log_size` refuses with `import_upstream_inconsistent`
+(never overridable); an equal identical boundary is accepted as a no-op;
+a higher version imports and advances the stored boundary. Refusals exit
+non-zero with a diagnostic naming the upstream `key_id` and both boundaries,
+and the `import_bundle` audit event (stderr, structured JSON) carries the
+compared `persisted`/`offered` boundaries and the outcome.
+`--accept-older-upstream` turns only the version-below refusal into a
+warning and imports without lowering the persisted high-water. The table is
+part of the database, so `backup` copies it; `verify-backup` does not compare
+it (the signed checkpoint carries no upstream state).
 
 ### Startup checkpoint gate
 
@@ -269,6 +293,13 @@ migration without changing log history. Expect the first post-upgrade startup
 to take longer on large logs (one chain walk plus incremental Merkle work);
 steady-state startups revalidate without rewriting, and per-request reads are
 single-row lookups.
+
+Schema version 4 adds `upstream_high_water` (one
+`(key_id, version, log_size, head, merkle_root, updated_at)` row per upstream
+public key, the highest accepted upstream boundary). The first startup on a
+version 2 or 3 database creates the empty table and bumps the markers; log
+history and the boundary cache are unchanged, and existing databases simply
+establish each upstream's high-water on its next import.
 
 `GET /health` serves a cached integrity verdict, so probes stay cheap no
 matter how large the log grows. A background verifier re-verifies the full
