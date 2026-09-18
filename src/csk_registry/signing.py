@@ -97,18 +97,37 @@ def generate_key() -> SigningKey:
     return SigningKey(Ed25519PrivateKey.generate())
 
 
-def load_key(pem: bytes) -> SigningKey:
-    key = serialization.load_pem_private_key(pem, password=None)
+def load_key(pem: bytes, passphrase: bytes | None = None) -> SigningKey:
+    """Load an Ed25519 private key from PKCS8 PEM.
+
+    Pass ``passphrase`` only for encrypted PEM: the backend raises
+    ``TypeError`` when the password/encryption combination mismatches, so
+    callers that accept both shapes (see ``keys.FileKeyProvider``) detect
+    the ``ENCRYPTED PRIVATE KEY`` marker before deciding.
+    """
+    key = serialization.load_pem_private_key(pem, password=passphrase)
     if not isinstance(key, Ed25519PrivateKey):
         raise ValueError("private key is not an Ed25519 key")
     return SigningKey(key)
 
 
-def export_key_pem(key: SigningKey) -> bytes:
+def export_key_pem(key: SigningKey, passphrase: bytes | None = None) -> bytes:
+    """Export ``key`` as PKCS8 PEM, encrypted when ``passphrase`` is given.
+
+    A ``None`` passphrase writes plain PEM, exactly as before. A non-empty
+    passphrase selects ``BestAvailableEncryption``; an empty one is rejected
+    by the backend.
+    """
+    if passphrase is None:
+        return key.private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
     return key.private.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
+        serialization.BestAvailableEncryption(passphrase),
     )
 
 

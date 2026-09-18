@@ -15,6 +15,7 @@ from .auth import Auditor, AuditorTokens
 from .bundle import export_bundle, import_bundle
 from .clock import utc_now
 from .keys import (
+    KeyPassphraseError,
     active_key_path,
     activate_rotation,
     cancel_rotation,
@@ -505,7 +506,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     func = args.func
-    result = func(args)
+    try:
+        result = func(args)
+    except KeyPassphraseError as exc:
+        # Encrypted-key commands fail closed at startup with one diagnostic
+        # naming the variable: no traceback, and for `serve` no listener
+        # (app_from_env raises before uvicorn.run is reached).
+        print(str(exc), file=sys.stderr)
+        return 1
     return int(result)
 
 

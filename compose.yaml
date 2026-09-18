@@ -17,6 +17,12 @@ services:
     environment:
       CURATOR_SKILL_REGISTRY_HOME: /data
       # CURATOR_SKILL_REGISTRY_CHECKPOINT: /checkpoint/registry-snapshot.json
+      # R6: passphrase for the encrypted signing key (see README). Never bake
+      # it into the image: inject it at deploy time from the host environment
+      # or an env file kept outside version control, for example:
+      # CSK_REGISTRY_KEY_PASSPHRASE: ${CSK_REGISTRY_KEY_PASSPHRASE:?Set CSK_REGISTRY_KEY_PASSPHRASE in the host environment}
+    # env_file:
+    #   - /run/secrets/curator-skill-registry.env  # holds CSK_REGISTRY_KEY_PASSPHRASE=...
     # The 30 s probe is a cheap cached-verdict read (no chain walk); the
     # server-side full re-verification interval is configured with
     # --health-verify-interval (default 300 s).

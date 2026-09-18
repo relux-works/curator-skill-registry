@@ -152,6 +152,70 @@ survive the change:
 `cancel-key-rotation --confirm` discards a staged key before activation.
 `genkey --force` refuses to replace the signer of a non-empty registry.
 
+### Passphrase-protected signing key
+
+The signing key can be stored as passphrase-encrypted PKCS8 instead of plain
+PEM. Set the passphrase before generating the key:
+
+```bash
+export CSK_REGISTRY_KEY_PASSPHRASE='<secret>'
+curator-skill-registry --home ./data genkey
+```
+
+When the variable is set, `genkey`, rotation staging, and rotation
+activation write encrypted PEM (`BestAvailableEncryption`), and every command
+plus `serve` decrypts with it. There is deliberately no `--passphrase` flag:
+process arguments are world-readable on most systems.
+
+- Encrypted key with the variable missing or wrong: the command (or `serve`
+  startup) fails closed with a single diagnostic naming the variable;
+  nothing starts.
+- Plain key with the variable set: still loads, so an existing deployment
+  keeps working while it migrates, but logs a warning that the key is
+  unencrypted.
+- Variable set but empty: rejected with a single diagnostic naming the
+  variable before any key is written or loaded; unset it for plain PEM or
+  set a non-empty value.
+- Variable unset: behaviour is exactly as before (plain PEM written and read).
+
+Encrypt an existing plain key in place (same key material; the file keeps its
+`0600` mode):
+
+```bash
+export CSK_REGISTRY_KEY_PASSPHRASE='<secret>'
+python - <<'EOF'
+import os
+from pathlib import Path
+from csk_registry import signing
+path = Path("./data/signing-key.pem")
+key = signing.load_key(path.read_bytes())
+path.write_bytes(signing.export_key_pem(key, os.environ["CSK_REGISTRY_KEY_PASSPHRASE"].encode()))
+print("encrypted:", key.key_id)
+EOF
+```
+
+Rotate the passphrase by re-encrypting with the new value (same key material,
+new secret):
+
+```bash
+export OLD_PASSPHRASE='<old secret>' CSK_REGISTRY_KEY_PASSPHRASE='<new secret>'
+python - <<'EOF'
+import os
+from pathlib import Path
+from csk_registry import signing
+path = Path("./data/signing-key.pem")
+key = signing.load_key(path.read_bytes(), passphrase=os.environ["OLD_PASSPHRASE"].encode())
+path.write_bytes(signing.export_key_pem(key, os.environ["CSK_REGISTRY_KEY_PASSPHRASE"].encode()))
+print("re-encrypted:", key.key_id)
+EOF
+```
+
+After either operation, re-run any key command (for example
+`export-snapshot`) to confirm the new secret decrypts, and if a rotation is
+staged, re-encrypt `next-signing-key.pem` the same way. See `compose.yaml`
+for wiring the secret without baking it into the image, and [SECURITY.md](SECURITY.md)
+for what the passphrase does and does not protect.
+
 ### Production transport and limits
 
 Plain HTTP is accepted only on a loopback bind. For direct TLS, pass

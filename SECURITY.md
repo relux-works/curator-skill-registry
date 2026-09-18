@@ -20,6 +20,26 @@ publish corrective records through an unaffected auditor. History is not
 rewritten. An auditor compromise disables that auditor credential and uses a
 different authorized auditor for corrective records.
 
+The signing key can additionally be stored as passphrase-encrypted PKCS8
+(`CSK_REGISTRY_KEY_PASSPHRASE`, see README). The passphrase protects the key
+at rest against an offline copy of the volume or key file made without the
+secret — a disk image, a backup, or the PEM file sitting beside
+`registry.db`: without the passphrase the PEM does not decrypt, so a bare
+volume leak no longer yields key and history together. It does not protect
+against a live process compromise (the running service necessarily holds both
+the key and the secret), nor against a deployment environment that leaks the
+variable itself, and it is no substitute for the owner-only file permissions
+above. The passphrase travels exclusively through the environment, never
+through argv. A present-but-empty value is rejected; only true absence
+selects plain PEM.
+
+All key loads and stores funnel through the `KeyProvider` seam in
+`src/csk_registry/keys.py`: the `KeyProvider` Protocol, the `FileKeyProvider`
+default, and the `default_key_provider()` factory that reads the variable.
+That seam is the hook point for an external key provider (KMS/HSM, profile
+§7): such a provider implements the Protocol and is passed to the key
+functions without touching call sites. No external provider is implemented.
+
 Restore is fail-closed: `serve --checkpoint` (or
 `CURATOR_SKILL_REGISTRY_CHECKPOINT`) compares live state against the signed
 external high-water checkpoint after integrity verification and before the

@@ -33,6 +33,19 @@
 
 ### Security
 
+- R6: optional passphrase-protected signing key via `CSK_REGISTRY_KEY_PASSPHRASE`
+  (environment only, never a CLI flag). When set, `genkey`, rotation
+  staging, and rotation activation write encrypted PKCS8 PEM
+  (`BestAvailableEncryption`) and every key load decrypts with it; when
+  unset, behaviour is unchanged. An encrypted key with the variable missing
+  or wrong fails closed with a single diagnostic naming the variable (no
+  traceback, no partial start); a plain key with the variable set loads
+  with an unencrypted-key warning; a present-but-empty variable is rejected
+  with a single diagnostic before any key write or load. Key loading and storing
+  funnel through the `csk_registry.keys.KeyProvider` seam (`FileKeyProvider`
+  default, `default_key_provider()` factory), documented in `SECURITY.md` as
+  the KMS hook point; no external provider is implemented. No protocol,
+  envelope, or key-material change (curator-spec `dced9b8`).
 - R3/P2: `serve --checkpoint <signed snapshot>`
   (`CURATOR_SKILL_REGISTRY_CHECKPOINT`) compares the live boundary against
   the operator checkpoint at startup, after the §5 integrity verification
