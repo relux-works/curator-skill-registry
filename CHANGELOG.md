@@ -33,6 +33,19 @@
 
 ### Security
 
+- R4: documented the reverse-proxy deployment the rate-limit and body bounds
+  assume (docs only, no wire-schema change, curator-spec `47c3c8c`).
+  `README.md` § Production transport and limits now states the rate-limit
+  model (network limiter on client host, 600/minute; concurrency semaphore,
+  128 slots with 0.1 s acquire; auditor limiter on auditor id,
+  120/minute), that a proxy without trusted forwarded headers collapses all
+  clients into one shared network bucket, and the recommended configuration
+  (`serve --behind-https-proxy --trusted-proxy <proxy IPs>`, forwarded
+  headers from other sources ignored) with a worked nginx snippet. The same
+  section states the body-before-auth squatting bounds (16 MiB, 15 s
+  deadline, `503 overloaded` semantics), the proxy-side mitigations (body,
+  connection, and timeout caps), and an operator checklist. `SECURITY.md`
+  points at that section from the threat model.
 - P4: `import-bundle` now persists a per-upstream high-water (`version`,
   `log_size`, `head`, `merkle_root` per upstream `key_id`) in a new
   `upstream_high_water` table (schema version 4, migrated once at startup)
@@ -62,6 +75,32 @@
   default, `default_key_provider()` factory), documented in `SECURITY.md` as
   the KMS hook point; no external provider is implemented. No protocol,
   envelope, or key-material change (curator-spec `dced9b8`).
+- R7: `verify-backup` without `--public-key` now warns prominently instead of
+  silently trusting the live home's keyring: it prints `WARNING: keys
+  resolved from the live home <path>; supply --public-key from an out-of-band
+  copy for an independent check` on stderr and records the same text in the
+  `warning` member of the JSON result on both the `backup_valid: true` and
+  `backup_valid: false` envelopes. The verdict and exit codes are unchanged
+  (still `0`/`2`), and the `--public-key` path emits no warning and keeps its
+  exact previous envelopes. Operators should pass the registry's pinned
+  public key from an out-of-band copy kept with the checkpoint outside the
+  primary store. No wire-schema change (curator-spec `47c3c8c`).
+- R8: idempotency retention raised from 24 h to 26 h
+  (`IDEMPOTENCY_TTL_SECONDS`): the registry-service profile §4 minimum is
+  "at least 24 hours from the first successful commit", and the two extra
+  hours of slack keep a client retry at the 24 h contract boundary, plus
+  network delay, deduplicated instead of double-appending. The store still
+  refuses any retention below the 24 h profile minimum, and the success,
+  replay (`200`), and conflict (`409`) envelopes are unchanged (curator-spec
+  `dced9b8`).
+- R5: JSON nested deeper than 100 levels is rejected with `400 invalid_json`
+  instead of `500 internal_error`. `protocol.load_json` enforces the bound
+  with an iterative pre-parse scan and maps `RecursionError` to the new
+  `JSONDepthError` (`ProtocolError`); the CCJ canonicalization entry points
+  enforce the same bound and map `RecursionError` to `CanonicalDepthError`.
+  `POST /v1/records` reports depth violations as `invalid_json` while other
+  record errors keep `invalid_record`, and over-deep cursors keep
+  `404 invalid_cursor`. No wire-schema change (curator-spec `47c3c8c`).
 - R3/P2: `serve --checkpoint <signed snapshot>`
   (`CURATOR_SKILL_REGISTRY_CHECKPOINT`) compares the live boundary against
   the operator checkpoint at startup, after the §5 integrity verification

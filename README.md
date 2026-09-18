@@ -91,7 +91,8 @@ curator-skill-registry --home ./data verify-chain      # verify the log hash cha
 curator-skill-registry --home ./data backup \
   --out /backups/registry.db --checkpoint-out /backups/registry-snapshot.json
 curator-skill-registry --home ./data verify-backup /backups/registry.db \
-  --checkpoint /secure-high-water/registry-snapshot.json
+  --checkpoint /secure-high-water/registry-snapshot.json \
+  --public-key ed25519:<pinned-registry-public-key>
 ```
 
 `backup` uses SQLite's consistent backup API and emits a signed snapshot
@@ -100,6 +101,18 @@ restoring, run `verify-backup` against that external high-water checkpoint; an
 older or equivocal database is refused. Stop all writers before replacing the
 live database. Signing keys and `auditors.json` are backed up separately using
 encrypted, access-controlled secret storage.
+
+`verify-backup` expects `--public-key` from an out-of-band copy of the
+registry's pinned signing key, so the check is independent of the home under
+test: take the key from the `genkey` (or `prepare-key-rotation` /
+`activate-key-rotation`) output or from `GET /v1/meta` `public_keys` while the
+deployment is known good, and store that copy with the checkpoint outside the
+primary store, encrypted and access controlled. Refresh the copy at every
+rotation before retiring the old key. Omitting `--public-key` still works for
+existing scripts but verifies against the live home's own keyring — which a
+compromised home defeats — and warns prominently on stderr and in the JSON
+result's `warning` member. Never copy the verification key from the live home
+under test.
 
 ### Upstream import high-water
 
@@ -248,7 +261,9 @@ reverse proxy requires `--behind-https-proxy --trusted-proxy <ip-list>`;
 forwarded headers from other sources are ignored.
 
 The process caps concurrent work, network-source request rate, auditor
-submission rate, page size, cursor size, and request bodies. `429` and overload
+submission rate, page size, cursor size, and request bodies. JSON text nested
+deeper than 100 levels of objects/arrays is rejected with `400 invalid_json`
+(over-deep pagination cursors stay `404 invalid_cursor`). `429` and overload
 `503` responses include `Retry-After`. The following settings accept positive
 integers:
 
@@ -257,6 +272,140 @@ CURATOR_SKILL_REGISTRY_MAX_CONCURRENT_REQUESTS
 CURATOR_SKILL_REGISTRY_NETWORK_REQUESTS_PER_MINUTE
 CURATOR_SKILL_REGISTRY_AUDITOR_SUBMISSIONS_PER_MINUTE
 ```
+
+#### Rate-limit model and reverse-proxy bucketing
+
+Three independent controls bound load, checked in this order per request:
+
+| Control | Keys on | Default bound | Refusal |
+|---|---|---|---|
+| Network limiter | client host (`network:<host>`) | 600 requests/minute, 60 s fixed window | `429 rate_limited` + `Retry-After` |
+| Concurrency semaphore | global slots | 128 slots, 0.1 s acquire wait | `503 overloaded` + `Retry-After: 1` |
+| Auditor limiter | auditor id (`auditor:<id>`), after token verification | 120 submissions/minute, 60 s fixed window | `429 rate_limited` + `Retry-After` |
+
+The network limiter keys on `request.client.host`. With forwarded headers
+disabled (the default), that is the TCP peer — so a reverse proxy without
+trusted forwarded headers collapses every client behind it into one shared
+`network:<proxy-ip>` bucket, and one noisy client throttles everyone.
+
+Recommended configuration: terminate TLS at the proxy, bind the service to
+loopback, and enable forwarded-header trust ONLY for the proxy's own
+addresses:
+
+```bash
+curator-skill-registry --home /data serve --host 127.0.0.1 --port 8082 \
+  --behind-https-proxy --trusted-proxy 127.0.0.1
+```
+
+The exact settings are the `serve` flags `--behind-https-proxy` (default:
+off — forwarded headers are ignored entirely) and `--trusted-proxy
+<comma-separated proxy IPs>` (default: unset; required together with
+`--behind-https-proxy`); there is no environment-variable equivalent. They
+map directly to Uvicorn `proxy_headers` / `forwarded_allow_ips`, and
+forwarded headers from other sources are ignored. List only the proxy
+addresses you operate — every listed address may set the client identity
+used for rate limiting and audit.
+
+Worked nginx example for the recommended setup (TLS at the proxy, service
+on loopback, proxy at `127.0.0.1` matching `--trusted-proxy` above):
+
+```nginx
+limit_conn_zone $binary_remote_addr zone=registry_conn:10m;
+
+upstream registry {
+    server 127.0.0.1:8082;
+}
+
+server {
+    listen 443 ssl;
+    server_name registry.example.com;
+
+    ssl_certificate     /etc/nginx/tls/registry.crt;
+    ssl_certificate_key /etc/nginx/tls/registry.key;
+
+    client_max_body_size 16m;  # reject oversized bodies at the edge
+    client_body_timeout 15s;   # idle gap allowed between successive body reads
+    limit_conn registry_conn 32;  # per-client connection cap
+
+    location / {
+        proxy_pass http://registry;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;  # upstream response reads, not the client body
+    }
+}
+```
+
+#### Body-before-auth bounds and proxy mitigations
+
+`POST /v1/records` reads the request body before verifying the auditor
+token: the body read accepts at most 16 MiB within a 15-second read
+deadline, and only then is the bearer token verified and the auditor
+limiter checked. A declared `Content-Length` over 16 MiB is refused with
+`413 request_too_large` before streaming starts; a stream is refused the
+same way once a received chunk pushes the buffered total past 16 MiB, so
+the bound covers the accepted/buffered body rather than raw inbound
+bandwidth. A body not fully received within the 15 s read deadline is
+refused with `503 request_timeout`. The 15 s bound scopes only the body
+read: a slot is acquired before routing and released after the route
+finishes, so a request holds one of the 128 concurrency slots while
+streaming; a request that cannot acquire a slot within 0.1 s is refused
+with `503 overloaded` and `Retry-After: 1`.
+
+What an unauthenticated attacker can and cannot do with these bounds:
+
+- Can: occupy concurrency slots with slow streams (each body read bounded
+  by the 15 s deadline), causing `503 overloaded` for other requests while
+  all 128 slots are held, and force the service to buffer up to 16 MiB per
+  stream.
+- Cannot, without a valid token: reach the auditor limiter or append a
+  record — token verification runs after the body read and rejects unknown
+  tokens before the auditor limiter is consulted. A request with a valid
+  token reaches the auditor limiter before its signature is validated, but
+  a record append additionally requires a valid schema and a signature that
+  verifies for the auditor. No refusal persists anything (no registry
+  append or persistent registry mutation, though network-limiter accounting
+  and an audit event still happen on refused requests), and there is no
+  amplification — one stream holds exactly one slot.
+
+`503 overloaded` is transient and retryable: it means "no slot within
+0.1 s", carries `Retry-After: 1`, causes no registry append or persistent
+registry mutation, and is audited like any other request. Treat sustained `overloaded` as a saturation signal (slow
+clients or an attack filling the slots), not a storage failure — storage
+failures report `503 storage_unavailable` / `503 not_ready` instead.
+
+Proxy-side mitigations (in front of the finite application limits):
+
+- Cap request bodies at the proxy (`client_max_body_size 16m` above) so
+  oversized streams are rejected before reaching the service.
+- Cap connections per client (`limit_conn` above) so one source cannot hold
+  many of the 128 slots at once.
+- Bound stalled uploads at the edge with `client_body_timeout`, which
+  limits the idle gap between successive body reads — not the total upload
+  duration, so a trickling client can still take longer than 15 s overall.
+  `proxy_read_timeout` covers a different scope (reads of the upstream
+  response) and does not bound the incoming body.
+
+Nginx buffers proxied request bodies by default (`proxy_request_buffering`
+is on): the complete body is received at the edge before forwarding, so in
+this setup slow-client occupancy sits primarily at the proxy rather than in
+the service's 128 slots.
+
+#### Operator checklist (proxy and load bounds)
+
+- [ ] TLS terminates at the proxy (or direct `--ssl-certfile` /
+  `--ssl-keyfile`); the service binds loopback or a private address only.
+- [ ] `serve` passes `--behind-https-proxy --trusted-proxy <proxy IPs>` —
+  proxy addresses only, never client ranges or `0.0.0.0/0`.
+- [ ] The proxy sets `X-Forwarded-For` / `X-Forwarded-Proto` (Uvicorn trusts
+  only these two headers, only from `--trusted-proxy`).
+- [ ] The proxy caps bodies at 16 MiB, connections per client, and request
+  timeouts (see the snippet above).
+- [ ] The three limiter env settings keep their defaults (600 / 120 / 128)
+  unless load testing says otherwise; `429`/`503` rates and `Retry-After`
+  compliance are monitored, and the `csk_registry.audit` event stream is
+  retained access-controlled.
 
 Run one writable service process per database on local durable storage. SQLite
 uses WAL, `synchronous=FULL`, a five-second lock deadline, serialized append
@@ -277,7 +426,7 @@ migration, the former `csk-registry` command and `CSK_REGISTRY_HOME` variable
 remain supported as compatibility aliases; the new names take precedence.
 
 Before upgrading a database created by a release that stored idempotency keys
-without auditor identity, stop submissions for the prior 24-hour retention
+without auditor identity, stop submissions for the prior 26-hour retention
 window. Startup refuses unexpired unscoped entries because assigning them to an
 auditor would be ambiguous. Expired entries are discarded while the schema is
 migrated; log history is unchanged.

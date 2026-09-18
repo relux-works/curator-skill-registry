@@ -7,7 +7,13 @@ import re
 import unicodedata
 from typing import Any
 
-from .signing import MAX_SAFE_INTEGER, canonical_document_bytes
+from .errors import ProtocolError as ProtocolError
+from .signing import (
+    MAX_JSON_DEPTH,
+    MAX_SAFE_INTEGER,
+    CanonicalDepthError,
+    canonical_document_bytes,
+)
 
 
 STATUSES = {"audited", "revoked", "deprecated", "pending"}
@@ -23,11 +29,74 @@ _WINDOWS_RESERVED = {"con", "prn", "aux", "nul"} | {
 }
 
 
-class ProtocolError(ValueError):
+class JSONDepthError(ProtocolError):
+    """Protocol JSON nested deeper than ``MAX_JSON_DEPTH``."""
+
     pass
 
 
+def _check_json_depth(raw: bytes | str) -> None:
+    """Reject JSON text nested deeper than ``MAX_JSON_DEPTH`` without parsing.
+
+    An iterative bracket scan outside strings, so pathological depth fails
+    before ``json.loads`` can recurse into the interpreter limit. Malformed
+    text is left for the parser to reject; only the depth bound is enforced.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+
+    def bump(opening: bool) -> None:
+        nonlocal depth
+        if opening:
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise JSONDepthError(
+                    f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}"
+                )
+        else:
+            depth = max(0, depth - 1)
+
+    if isinstance(raw, bytes):
+        for byte in raw:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif byte == 0x5C:  # backslash
+                    escaped = True
+                elif byte == 0x22:  # quote
+                    in_string = False
+            elif byte == 0x22:
+                in_string = True
+            elif byte == 0x7B or byte == 0x5B:  # { [
+                bump(True)
+            elif byte == 0x7D or byte == 0x5D:  # } ]
+                bump(False)
+    else:
+        for character in raw:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+            elif character == '"':
+                in_string = True
+            elif character == "{" or character == "[":
+                bump(True)
+            elif character == "}" or character == "]":
+                bump(False)
+
+
 def load_json(raw: bytes | str) -> Any:
+    """Parse protocol JSON, rejecting over-deep documents.
+
+    Documents nested deeper than ``MAX_JSON_DEPTH`` (100 levels of
+    objects/arrays) raise :class:`JSONDepthError`, a ``ProtocolError``;
+    ``RecursionError`` from the parser or canonicalization is mapped to
+    the same error so callers only handle ``ProtocolError``.
+    """
     if (isinstance(raw, bytes) and raw.startswith(b"\xef\xbb\xbf")) or (
         isinstance(raw, str) and raw.startswith("\ufeff")
     ):
@@ -51,6 +120,7 @@ def load_json(raw: bytes | str) -> Any:
         raise ProtocolError(f"registry JSON does not allow non-integer number {text!r}")
 
     try:
+        _check_json_depth(raw)
         value = json.loads(
             raw,
             object_pairs_hook=object_pairs,
@@ -60,10 +130,34 @@ def load_json(raw: bytes | str) -> Any:
         )
         canonical_document_bytes(value)
         return value
+    except JSONDepthError:
+        raise
+    except CanonicalDepthError as exc:
+        raise JSONDepthError(str(exc)) from exc
     except ProtocolError:
         raise
+    except RecursionError as exc:
+        raise JSONDepthError(
+            f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}"
+        ) from exc
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ProtocolError(f"invalid protocol JSON: {exc}") from exc
+
+
+def _canonicalize_validated(value: Any) -> None:
+    """Canonicalize a validated object, mapping depth failures to ``ProtocolError``.
+
+    Only depth violations are converted; other CCJ errors keep their
+    existing ``CanonicalError`` behaviour.
+    """
+    try:
+        canonical_document_bytes(value)
+    except CanonicalDepthError as exc:
+        raise JSONDepthError(str(exc)) from exc
+    except RecursionError as exc:
+        raise JSONDepthError(
+            f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}"
+        ) from exc
 
 
 def validate_record(record: Any) -> dict[str, Any]:
@@ -114,7 +208,7 @@ def validate_record(record: Any) -> dict[str, Any]:
         ):
             raise ProtocolError("audit record endorsement requires an endorser")
         validate_signature(endorsement.get("sig"))
-    canonical_document_bytes(record)
+    _canonicalize_validated(record)
     return record
 
 
@@ -162,7 +256,7 @@ def validate_snapshot(snapshot: Any) -> dict[str, Any]:
     if not isinstance(created_at, str) or _TIMESTAMP.fullmatch(created_at) is None:
         raise ProtocolError("snapshot timestamp is malformed")
     validate_signature(snapshot.get("sig"))
-    canonical_document_bytes(snapshot)
+    _canonicalize_validated(snapshot)
     return snapshot
 
 

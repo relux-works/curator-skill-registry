@@ -11,31 +11,65 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from .errors import ProtocolError
+
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
+MAX_JSON_DEPTH = 100
+"""Maximum accepted JSON nesting depth (nested objects/arrays).
+
+Inputs nested deeper than this are rejected before they can recurse into
+the interpreter limit, so pathological documents fail closed as client
+errors instead of raising ``RecursionError``.
+"""
 
 
 class CanonicalError(ValueError):
     pass
 
 
+class CanonicalDepthError(CanonicalError, ProtocolError):
+    """CCJ-1 input nested deeper than ``MAX_JSON_DEPTH``.
+
+    A ``ProtocolError`` so request-layer callers catch depth failures with
+    the protocol contract, while remaining ``CanonicalError`` /
+    ``ValueError`` compatible for existing handlers.
+    """
+
+
 def canonical_bytes(record: dict[str, Any]) -> bytes:
-    """Return Curator Canonical JSON 1 bytes for a signed object."""
+    """Return Curator Canonical JSON 1 bytes for a signed object.
+
+    Inputs nested deeper than ``MAX_JSON_DEPTH`` raise
+    :class:`CanonicalDepthError` (catchable as ``ProtocolError``).
+    """
     body = {key: value for key, value in record.items() if key != "sig"}
     return _canonical_document(body)
 
 
 def canonical_document_bytes(value: Any) -> bytes:
-    """Canonicalize a complete JSON value without stripping a signature."""
+    """Canonicalize a complete JSON value without stripping a signature.
+
+    Inputs nested deeper than ``MAX_JSON_DEPTH`` raise
+    :class:`CanonicalDepthError` (catchable as ``ProtocolError``).
+    """
     return _canonical_document(value)
 
 
 def _canonical_document(value: Any) -> bytes:
-    _validate_ccj(value)
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        _validate_ccj(value)
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except CanonicalDepthError:
+        raise
+    except RecursionError as exc:
+        raise CanonicalDepthError(
+            f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}"
+        ) from exc
 
 
-def _validate_ccj(value: Any) -> None:
+def _validate_ccj(value: Any, depth: int = 0) -> None:
     if value is None or isinstance(value, bool):
         return
     if isinstance(value, int):
@@ -49,15 +83,23 @@ def _validate_ccj(value: Any) -> None:
             raise CanonicalError("CCJ-1 strings must not contain lone surrogates")
         return
     if isinstance(value, list):
+        if depth + 1 > MAX_JSON_DEPTH:
+            raise CanonicalDepthError(
+                f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}"
+            )
         for item in value:
-            _validate_ccj(item)
+            _validate_ccj(item, depth + 1)
         return
     if isinstance(value, dict):
+        if depth + 1 > MAX_JSON_DEPTH:
+            raise CanonicalDepthError(
+                f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}"
+            )
         for key, item in value.items():
             if not isinstance(key, str):
                 raise CanonicalError("CCJ-1 object keys must be strings")
-            _validate_ccj(key)
-            _validate_ccj(item)
+            _validate_ccj(key, depth + 1)
+            _validate_ccj(item, depth + 1)
         return
     raise CanonicalError(f"CCJ-1 does not support {type(value).__name__}")
 
@@ -161,7 +203,7 @@ def verify_signed(public_pinned: str, obj: dict[str, Any]) -> bool:
     try:
         public = parse_public_key(public_pinned)
         canonical = canonical_bytes(obj)
-    except (ValueError, CanonicalError):
+    except (ValueError, RecursionError):
         return False
     if sig.get("algorithm") != "ed25519":
         return False

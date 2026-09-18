@@ -32,6 +32,7 @@ from .keys import load_active_key, public_keys
 from .limits import FixedWindowLimiter
 from .permissions import protect_private_directory
 from .protocol import (
+    JSONDepthError,
     ProtocolError,
     load_json,
     validate_record,
@@ -39,7 +40,9 @@ from .protocol import (
     validate_source_identity,
 )
 from .signing import (
+    MAX_JSON_DEPTH,
     SigningKey,
+    CanonicalDepthError,
     canonical_bytes,
     canonical_document_bytes,
     verify,
@@ -59,7 +62,12 @@ from .store import (
 MAX_PAGE_SIZE = 1000
 MAX_BODY_BYTES = 16 * 1024 * 1024
 CURSOR_TTL_SECONDS = 3600
-IDEMPOTENCY_TTL_SECONDS = 24 * 3600
+# Registry-service profile §4 (curator-spec dced9b8): "Retention is at least
+# 24 hours from the first successful commit and is not shortened by restart,
+# cleanup, or credential rotation." The two extra hours are slack so a client
+# retry at the 24 h contract boundary, plus network delay, is still
+# deduplicated instead of double-appending (R8).
+IDEMPOTENCY_TTL_SECONDS = 26 * 3600
 DEFAULT_MAX_CONCURRENT_REQUESTS = 128
 DEFAULT_NETWORK_REQUESTS_PER_MINUTE = 600
 DEFAULT_AUDITOR_SUBMISSIONS_PER_MINUTE = 120
@@ -410,8 +418,20 @@ def create_app(
             )
         try:
             record = validate_record(load_json(body))
+        except JSONDepthError as exc:
+            raise APIError(400, "invalid_json", str(exc)) from exc
+        except CanonicalDepthError as exc:
+            raise APIError(400, "invalid_json", str(exc)) from exc
         except ProtocolError as exc:
             raise APIError(400, "invalid_record", str(exc)) from exc
+        except RecursionError as exc:
+            # Unreachable: load_json and canonicalization already map
+            # over-deep input, but a pathological body must never be a 500.
+            raise APIError(
+                400,
+                "invalid_json",
+                f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}",
+            ) from exc
         if not verify_signed(auditor.public_pinned, record):
             raise APIError(400, "invalid_signature", "record signature does not verify for this auditor")
         countersigned = _countersign(record, signing_key, endorser=auditor.auditor_id)
@@ -420,7 +440,16 @@ def create_app(
                 not 0x21 <= ord(character) <= 0x7E for character in idempotency_key
             ):
                 raise APIError(400, "invalid_idempotency_key", "Idempotency-Key is malformed")
-            body_sha256 = hashlib.sha256(canonical_bytes(record)).hexdigest()
+            try:
+                body_sha256 = hashlib.sha256(canonical_bytes(record)).hexdigest()
+            except (CanonicalDepthError, RecursionError) as exc:
+                # Unreachable: the record already passed validation, but a
+                # pathological body must never be a 500.
+                raise APIError(
+                    400,
+                    "invalid_json",
+                    f"JSON nesting exceeds maximum depth of {MAX_JSON_DEPTH}",
+                ) from exc
             try:
                 response, replayed = store.append_idempotent(
                     countersigned,
@@ -552,7 +581,7 @@ def _cursor_state(
         ):
             raise ValueError("value")
         return offset, boundary, snapshot
-    except (ValueError, ProtocolError) as exc:
+    except (ValueError, ProtocolError, RecursionError) as exc:
         raise APIError(404, "invalid_cursor", "pagination cursor is invalid or expired") from exc
 
 

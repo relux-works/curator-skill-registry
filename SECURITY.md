@@ -47,9 +47,15 @@ service becomes ready, and a live state below or inconsistent with it stays
 up non-ready with writes disabled instead of serving stale state. This
 startup comparison is the normative "before the service becomes ready" gate;
 `verify-backup` stays as the offline operator procedure for vetting a
-candidate backup before a restore. Keep checkpoints and secret backups
-outside the primary store, encrypted and access controlled. Cursor and
-response data never bootstrap trust; clients pin registry keys out of band.
+candidate backup before a restore. Give `verify-backup` its `--public-key`
+from an out-of-band copy of the registry's pinned signing key, recorded at
+`genkey`/rotation time and kept with the checkpoint outside the primary
+store; omitting the flag verifies against the live home's own keyring, which
+a compromised home defeats, so the command warns prominently on stderr and
+in its JSON `warning` member in that case. Keep checkpoints, pinned-key
+copies, and secret backups outside the primary store, encrypted and access
+controlled. Cursor and response data never bootstrap trust; clients pin
+registry keys out of band.
 Pagination is fail-closed too: a cursor page is served only at the cursor's
 carried boundary, and a carried boundary that disagrees with the committed
 log or is no longer available is refused with `404 invalid_cursor` rather
@@ -75,6 +81,18 @@ that stops completing trips the staleness bound (twice the interval) into a
 non-ready state that is transient instead of latched: the next successful
 pass restores readiness automatically, while a failed pass still latches
 until restart.
+
+Rate limiting is proxy-aware by deployment, not by default: the network
+limiter keys on the observed client host, so a reverse proxy without
+trusted forwarded headers collapses all clients into one shared bucket,
+and `POST /v1/records` streams up to 16 MiB (15 s deadline) holding one of
+the 128 concurrency slots before the auditor token is verified — bounded,
+but saturable into transient `503 overloaded` by unauthenticated slow
+streams. The threat model therefore requires the proxy deployment in
+[README § Production transport and limits](README.md#production-transport-and-limits):
+TLS at the proxy, forwarded-header trust only for the proxy's own addresses
+(`serve --behind-https-proxy --trusted-proxy`), and proxy-side body,
+connection, and timeout caps.
 
 The complete normative threat model and deployment requirements are in the
 [Curator registry-service profile](https://github.com/relux-works/curator-spec/blob/main/profiles/registry-service.md).

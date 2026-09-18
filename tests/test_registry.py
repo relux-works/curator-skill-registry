@@ -14,6 +14,7 @@ import tomllib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -28,7 +29,7 @@ from csk_registry import (
     home_from_env,
     signing,
 )
-from csk_registry.app import _encode_cursor, app_from_env, create_app
+from csk_registry.app import _encode_cursor, _url64, app_from_env, create_app
 from csk_registry.auth import Auditor, AuditorTokens
 from csk_registry.checkpoint import CheckpointView, compare_checkpoint
 from csk_registry.cli import build_parser, main
@@ -39,7 +40,14 @@ from csk_registry.permissions import (
     protect_private_directory,
     protect_private_file,
 )
-from csk_registry.protocol import ProtocolError, portable_path, validate_record, validate_source_identity
+from csk_registry.protocol import (
+    JSONDepthError,
+    ProtocolError,
+    load_json,
+    portable_path,
+    validate_record,
+    validate_source_identity,
+)
 from csk_registry.snapshot import build_snapshot
 from csk_registry.store import (
     CursorBoundaryMismatch,
@@ -281,6 +289,123 @@ def test_submit_rejects_wrong_signature(tmp_path: Path):
     record = other.sign_record(_body("audited"))
     resp = client.post("/v1/records", json=record, headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 400
+
+
+def _nested_list(depth: int) -> list[Any]:
+    value: list[Any] = []
+    for _ in range(depth - 1):
+        value = [value]
+    return value
+
+
+def test_load_json_rejects_over_deep_nesting():
+    bound = signing.MAX_JSON_DEPTH
+    assert isinstance(load_json("[" * bound + "]" * bound), list)
+    assert isinstance(load_json('{"a":' * bound + "1" + "}" * bound), dict)
+    for raw in (
+        "[" * (bound + 1) + "]" * (bound + 1),
+        ('{"a":' * (bound + 1) + "1" + "}" * (bound + 1)).encode("utf-8"),
+        "[" * 5000 + "]" * 5000,
+    ):
+        with pytest.raises(JSONDepthError) as excinfo:
+            load_json(raw)
+        assert str(bound) in str(excinfo.value)
+        with pytest.raises(ProtocolError):
+            load_json(raw)
+    # Brackets inside strings do not count toward the bound.
+    load_json('{"k": "' + "[" * (bound + 10) + '"}')
+    load_json(b'{"k": "' + b"[" * (bound + 10) + b'"}')
+
+
+def test_load_json_maps_recursion_error_to_depth_error(monkeypatch: pytest.MonkeyPatch):
+    def boom(value: object) -> bytes:
+        raise RecursionError("boom")
+
+    monkeypatch.setattr("csk_registry.protocol.canonical_document_bytes", boom)
+    with pytest.raises(JSONDepthError, match="maximum depth"):
+        load_json('{"a": 1}')
+
+
+def test_canonicalization_rejects_over_deep_nesting():
+    bound = signing.MAX_JSON_DEPTH
+    signing.canonical_document_bytes(_nested_list(bound))
+    with pytest.raises(signing.CanonicalDepthError) as excinfo:
+        signing.canonical_document_bytes(_nested_list(bound + 1))
+    assert str(bound) in str(excinfo.value)
+    with pytest.raises(signing.CanonicalDepthError, match="maximum depth"):
+        signing.canonical_bytes({"k": _nested_list(bound + 1)})
+    assert signing.verify_signed("ed25519:" + "A" * 43 + "=", {"k": _nested_list(bound + 1)}) is False
+    # Depth failures honor the protocol contract while keeping
+    # CanonicalError/ValueError compatibility for existing handlers.
+    assert issubclass(signing.CanonicalDepthError, ProtocolError)
+    assert issubclass(signing.CanonicalDepthError, signing.CanonicalError)
+    with pytest.raises(ProtocolError, match="maximum depth"):
+        signing.canonical_document_bytes(_nested_list(bound + 1))
+    with pytest.raises(ProtocolError, match="maximum depth"):
+        signing.canonical_bytes({"k": _nested_list(bound + 1)})
+
+
+@pytest.mark.parametrize("entry_point", ["canonical_bytes", "canonical_document_bytes"])
+@pytest.mark.parametrize("fault", ["validate_ccj", "json_dumps"])
+def test_canonicalization_maps_recursion_error_to_protocol_error(
+    monkeypatch: pytest.MonkeyPatch, entry_point: str, fault: str
+):
+    if fault == "validate_ccj":
+        # RecursionError raised from the CCJ validation path.
+        def boom_validate(value: object, depth: int = 0) -> None:
+            raise RecursionError("boom")
+
+        monkeypatch.setattr("csk_registry.signing._validate_ccj", boom_validate)
+    else:
+        # RecursionError raised from JSON serialization.
+        def boom_dumps(*args: Any, **kwargs: Any) -> str:
+            raise RecursionError("boom")
+
+        monkeypatch.setattr("csk_registry.signing.json.dumps", boom_dumps)
+    call = getattr(signing, entry_point)
+    with pytest.raises(signing.CanonicalDepthError, match="maximum depth"):
+        call({"a": 1})
+    with pytest.raises(ProtocolError, match="maximum depth"):
+        call({"a": 1})
+
+
+def test_submit_rejects_deeply_nested_json_with_invalid_json(tmp_path: Path):
+    client, _, token = _client(tmp_path)
+    bound = signing.MAX_JSON_DEPTH
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # Just over the explicit bound (far below the interpreter limit).
+    over = "[" * (bound + 1) + "]" * (bound + 1)
+    resp = client.post("/v1/records", content=over, headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_json"
+    # Pathological depth that previously raised RecursionError -> 500.
+    pathological = "[" * 5000 + "]" * 5000
+    resp = client.post("/v1/records", content=pathological, headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_json"
+    # Same verdict on the idempotent-submit path.
+    resp = client.post(
+        "/v1/records",
+        content=pathological,
+        headers={**headers, "Idempotency-Key": "deep-key"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_json"
+    # Non-depth errors keep their existing mapping.
+    resp = client.post("/v1/records", content="{bad json", headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_record"
+
+
+def test_deeply_nested_cursor_is_invalid_cursor_not_500(tmp_path: Path):
+    client, key, _ = _client(tmp_path)
+    payload = ("[" * 1200 + "]" * 1200).encode("utf-8")
+    signature = base64.b64decode(key.sign(payload))
+    cursor = f"{_url64(payload)}.{_url64(signature)}"
+    assert len(cursor) <= 4096
+    resp = client.get("/v1/log", params={"since": 0, "limit": 1, "cursor": cursor})
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "invalid_cursor"
 
 
 def test_submission_audit_log_is_structured_and_omits_bearer_token(
@@ -670,6 +795,159 @@ def test_backup_cli_emits_and_verifies_signed_checkpoint(tmp_path: Path):
             str(newer_checkpoint),
         ]
     ) == 2
+
+
+def test_verify_backup_without_public_key_warns_on_stderr_and_in_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    protect_private_directory(home)
+    key = signing.generate_key()
+    key_path = home / "signing-key.pem"
+    key_path.write_bytes(signing.export_key_pem(key))
+    protect_private_file(key_path)
+    store = Store(home / "registry.db")
+    store.append(key.sign_record(_body()), created_at="2026-07-07T00:00:00Z")
+    store.close()
+
+    backup = tmp_path / "backup.db"
+    checkpoint = tmp_path / "checkpoint.json"
+    assert main(
+        [
+            "--home",
+            str(home),
+            "backup",
+            "--out",
+            str(backup),
+            "--checkpoint-out",
+            str(checkpoint),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "--home",
+            str(home),
+            "verify-backup",
+            str(backup),
+            "--checkpoint",
+            str(checkpoint),
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["backup_valid"] is True
+    assert str(home) in payload["warning"]
+    assert "--public-key" in payload["warning"]
+    assert "out-of-band" in payload["warning"]
+    assert "WARNING" in captured.err
+    assert str(home) in captured.err
+    assert "--public-key" in captured.err
+
+    live = Store(home / "registry.db")
+    live.append(key.sign_record(_body("revoked")), created_at="2026-07-07T01:00:00Z")
+    newer_checkpoint = tmp_path / "newer-checkpoint.json"
+    newer_checkpoint.write_text(
+        json.dumps(build_snapshot(live, key)),
+        encoding="utf-8",
+    )
+    live.close()
+    assert main(
+        [
+            "--home",
+            str(home),
+            "verify-backup",
+            str(backup),
+            "--checkpoint",
+            str(newer_checkpoint),
+        ]
+    ) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["backup_valid"] is False
+    assert "error" in payload
+    assert str(home) in payload["warning"]
+    assert "--public-key" in payload["warning"]
+    assert "WARNING" in captured.err
+    assert str(home) in captured.err
+
+
+def test_verify_backup_with_explicit_public_key_is_quiet(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    protect_private_directory(home)
+    key = signing.generate_key()
+    key_path = home / "signing-key.pem"
+    key_path.write_bytes(signing.export_key_pem(key))
+    protect_private_file(key_path)
+    store = Store(home / "registry.db")
+    store.append(key.sign_record(_body()), created_at="2026-07-07T00:00:00Z")
+    store.close()
+
+    backup = tmp_path / "backup.db"
+    checkpoint = tmp_path / "checkpoint.json"
+    assert main(
+        [
+            "--home",
+            str(home),
+            "backup",
+            "--out",
+            str(backup),
+            "--checkpoint-out",
+            str(checkpoint),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "--home",
+            str(home),
+            "verify-backup",
+            str(backup),
+            "--checkpoint",
+            str(checkpoint),
+            "--public-key",
+            key.public_pinned,
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert set(payload) == {"backup_valid", "log_size", "head"}
+    assert payload["backup_valid"] is True
+    assert "live home" not in captured.err
+    assert "out-of-band" not in captured.err
+
+    live = Store(home / "registry.db")
+    live.append(key.sign_record(_body("revoked")), created_at="2026-07-07T01:00:00Z")
+    newer_checkpoint = tmp_path / "newer-checkpoint.json"
+    newer_checkpoint.write_text(
+        json.dumps(build_snapshot(live, key)),
+        encoding="utf-8",
+    )
+    live.close()
+    assert main(
+        [
+            "--home",
+            str(home),
+            "verify-backup",
+            str(backup),
+            "--checkpoint",
+            str(newer_checkpoint),
+            "--public-key",
+            key.public_pinned,
+        ]
+    ) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert set(payload) == {"backup_valid", "error"}
+    assert payload["backup_valid"] is False
+    assert "live home" not in captured.err
+    assert "out-of-band" not in captured.err
 
 
 def _startup_home(home: Path, *, records: int) -> tuple[signing.SigningKey, str]:
@@ -1431,6 +1709,63 @@ def test_submission_idempotency_replays_and_conflicts(tmp_path: Path):
     assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "idempotency_conflict"
     assert len(client.get("/v1/log").json()["entries"]) == 1
+
+
+class _ManualAppClock:
+    """Injectable ``time`` replacement for deterministic idempotency TTL tests."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_idempotency_retry_within_slack_window_is_deduplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csk_registry.app as app_module
+
+    assert app_module.IDEMPOTENCY_TTL_SECONDS == 26 * 3600
+    client, _, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    clock = _ManualAppClock(1_800_000_000.0)
+    monkeypatch.setattr(app_module, "time", clock)
+    headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": "slack-key"}
+    record = auditor_key.sign_record(_body("audited"))
+    first = client.post("/v1/records", json=record, headers=headers)
+    assert first.status_code == 201
+    # A retry at 25 h — past the 24 h contract minimum but inside the 26 h
+    # retention — replays the original response without a second append.
+    clock.now += 25 * 3600
+    replay = client.post("/v1/records", json=record, headers=headers)
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(client.get("/v1/log").json()["entries"]) == 1
+
+
+def test_idempotency_retry_past_retention_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import csk_registry.app as app_module
+
+    client, _, token = _client(tmp_path)
+    auditor_key = client.app.state.auditor_key  # type: ignore[attr-defined]
+    clock = _ManualAppClock(1_800_000_000.0)
+    monkeypatch.setattr(app_module, "time", clock)
+    headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": "expiry-key"}
+    record = auditor_key.sign_record(_body("audited"))
+    first = client.post("/v1/records", json=record, headers=headers)
+    assert first.status_code == 201
+    # A retry past the 26 h retention is a new submission, not a replay.
+    clock.now += 26 * 3600 + 1
+    second = client.post("/v1/records", json=record, headers=headers)
+    assert second.status_code == 201
+    assert second.json()["seq"] == first.json()["seq"] + 1
+    assert len(client.get("/v1/log").json()["entries"]) == 2
 
 
 @pytest.mark.parametrize(

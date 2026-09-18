@@ -322,8 +322,18 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _implicit_key_warning(home: Path) -> str:
+    return (
+        f"keys resolved from the live home {home}; supply --public-key "
+        "from an out-of-band copy for an independent check"
+    )
+
+
 def _cmd_verify_backup(args: argparse.Namespace) -> int:
     home = _home(args)
+    warning = None if args.public_key else _implicit_key_warning(home)
+    if warning is not None:
+        print(f"WARNING: {warning}", file=sys.stderr)
     try:
         store = Store(Path(args.database).expanduser())
         checkpoint_value = load_json(Path(args.checkpoint).expanduser().read_bytes())
@@ -341,18 +351,19 @@ def _cmd_verify_backup(args: argparse.Namespace) -> int:
         if not store.checkpoint_matches(boundary):
             raise ValueError("backup is below or inconsistent with the checkpoint")
     except (OSError, ValueError, StoreIntegrityError) as exc:
-        print(json.dumps({"backup_valid": False, "error": str(exc)}, indent=2))
+        payload: dict[str, object] = {"backup_valid": False, "error": str(exc)}
+        if warning is not None:
+            payload["warning"] = warning
+        print(json.dumps(payload, indent=2))
         return 2
-    print(
-        json.dumps(
-            {
-                "backup_valid": True,
-                "log_size": boundary.log_size,
-                "head": boundary.head,
-            },
-            indent=2,
-        )
-    )
+    success: dict[str, object] = {
+        "backup_valid": True,
+        "log_size": boundary.log_size,
+        "head": boundary.head,
+    }
+    if warning is not None:
+        success["warning"] = warning
+    print(json.dumps(success, indent=2))
     return 0
 
 
@@ -493,7 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify_backup.add_argument("--checkpoint", required=True, help="signed checkpoint JSON")
     verify_backup.add_argument(
         "--public-key",
-        help="checkpoint signing key (default: registry key under --home)",
+        help=(
+            "checkpoint signing key from an out-of-band copy "
+            "(default: registry keys under --home, with a warning)"
+        ),
     )
     verify_backup.set_defaults(func=_cmd_verify_backup)
 
