@@ -1102,3 +1102,45 @@ def test_shared_service_cache_control_vectors(case: dict[str, Any], tmp_path: Pa
         response = client.get("/v1/records")
     cache_control = response.headers.get("Cache-Control", "")
     assert case["cache_control"] in cache_control
+
+
+@pytest.mark.parametrize('schema_name', [
+    'audit-record-v1.schema.json', 'audit-record-v2.schema.json',
+    'registry-log-entry-v2.schema.json', 'registry-bundle-v2.schema.json',
+    'log-response-v3.schema.json',
+])
+def test_hash_version_schema_vectors(schema_name: str) -> None:
+    validator = _envelope_validator(schema_name)
+    cases = [case for case in _json('schema-cases/index.json') if case['schema'] == schema_name]
+    assert cases
+    for case in cases:
+        instance = _json('schema-cases/' + case['instance'])
+        assert validator.is_valid(instance) == case['valid']
+        if schema_name.startswith('audit-record'):
+            if case['valid']:
+                validate_record(instance)
+            else:
+                with pytest.raises(ProtocolError):
+                    validate_record(instance)
+
+
+def test_v2_service_outputs_match_pinned_shapes(tmp_path: Path) -> None:
+    from csk_registry.bundle import export_bundle, import_bundle
+    from test_hash_version import body, publish
+    from test_registry import _client
+
+    client, key, token = _client(tmp_path)
+    for version in [1, 2]:
+        assert publish(client, client.app.state.auditor_key, token, body(version)).status_code == 201
+    log = client.get('/v1/log').json()
+    _assert_valid_envelope('log-response-v3.schema.json', log)
+    _assert_invalid_envelope('log-response-v2.schema.json', log)
+    for entry in log['entries']:
+        _assert_valid_envelope('registry-log-entry-v2.schema.json', entry)
+    store = Store(tmp_path / 'r.db')
+    bundle = export_bundle(store, key)
+    _assert_valid_envelope('registry-bundle-v2.schema.json', bundle)
+    _assert_invalid_envelope('registry-bundle-v1.schema.json', bundle)
+    downstream = Store(tmp_path / 'import.db')
+    assert import_bundle(downstream, signing.generate_key(), bundle, upstream_public_key=key.public_pinned) == 2
+    _assert_valid_envelope('registry-snapshot-v1.schema.json', client.get('/v1/snapshot').json())

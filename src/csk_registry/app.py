@@ -236,7 +236,7 @@ def create_app(
             "name": registry_name,
             "version": __version__,
             "public_keys": list(accepted_signing_keys),
-            "record_schema_versions": [1],
+            "record_schema_versions": [1, 2],
             "policy": "append-only signed records with deny-wins revocation",
             "limits": {"max_page_size": MAX_PAGE_SIZE, "max_body_bytes": MAX_BODY_BYTES},
         }
@@ -248,12 +248,13 @@ def create_app(
         source_identity: str = Query(default=""),
         commit: str = Query(default=""),
         content_sha256: str = Query(default=""),
+        hash_version: str = Query(default=""),
         limit: int = Query(default=100, ge=1, le=MAX_PAGE_SIZE),
         cursor: str = Query(default=""),
     ) -> dict[str, Any]:
         _validate_query_parameters(
             request,
-            {"source_identity", "commit", "content_sha256", "limit", "cursor"},
+            {"source_identity", "commit", "content_sha256", "hash_version", "limit", "cursor"},
         )
         if bool(source_identity) != bool(commit):
             raise APIError(400, "invalid_query", "source_identity and commit must appear together")
@@ -268,12 +269,17 @@ def create_app(
             raise APIError(400, "invalid_query", "commit must be a full lowercase object id")
         if content_sha256 and re.fullmatch(r"sha256:[0-9a-f]{64}", content_sha256) is None:
             raise APIError(400, "invalid_query", "content_sha256 is malformed")
+        if hash_version and (hash_version not in {"1", "2"} or not content_sha256):
+            raise APIError(400, "invalid_query", "hash_version requires content_sha256 and must be 1 or 2")
+        selected_hash_version = int(hash_version or "1") if content_sha256 else None
         query = {
             "source_identity": source_identity,
             "commit": commit,
             "content_sha256": content_sha256,
             "limit": limit,
         }
+        if selected_hash_version == 2:
+            query["hash_version"] = selected_hash_version
         if cursor:
             offset, boundary, boundary_snapshot = _cursor_state(
                 store,
@@ -287,6 +293,7 @@ def create_app(
                     source_identity=source_identity,
                     commit=commit,
                     content_sha256=content_sha256,
+                    hash_version=selected_hash_version,
                     limit=limit,
                     offset=offset,
                     boundary=boundary,
@@ -303,6 +310,7 @@ def create_app(
                 source_identity=source_identity,
                 commit=commit,
                 content_sha256=content_sha256,
+                hash_version=selected_hash_version,
                 limit=limit,
                 offset=offset,
                 max_seq=boundary.log_size,
@@ -479,7 +487,7 @@ def create_app(
 def _countersign(record: dict[str, Any], signing_key: SigningKey, *, endorser: str) -> dict[str, Any]:
     endorsement = {"endorser": endorser, "sig": record.get("sig")}
     body = {key: value for key, value in record.items() if key != "sig"}
-    body["schema_version"] = 1
+    body["schema_version"] = record.get("schema_version", 1)
     existing = body.get("endorsements")
     body["endorsements"] = ([*existing, endorsement] if isinstance(existing, list) else [endorsement])
     return signing_key.sign_record(body)
