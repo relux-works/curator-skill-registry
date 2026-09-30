@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: relux-works/curator-spec
-          ref: 47c3c8cbd5da5e3fd6d99b0327d382c6a36494fe
+          ref: b1a2efb6fa28d014968a2a8fd7641823b5f3cf28
           path: protocol-spec
       - uses: actions/setup-python@v5
         with:

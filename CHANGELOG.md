@@ -4,6 +4,10 @@
 
 ### Added
 
+- Support framing-v2 audit records, version-scoped content queries, and mixed
+  version bundle imports/exports while preserving signed v1 history. See
+  [deployment guidance](docs/content-hash-versions.md).
+
 - Added snapshot-bound signed pagination, exact artifact identity, conjunctive
   filters, and explicit ambiguity rejection.
 - Added serialized durable append, auditor-scoped idempotency, startup recovery

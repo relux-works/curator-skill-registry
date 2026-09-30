@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Literal, NoReturn
 
+from .protocol import validate_hash_version
 from .checkpoint import REFUSAL_DIAGNOSTICS, CheckpointView, compare_checkpoint
 from .permissions import protect_private_file
 from .signing import canonical_bytes
@@ -890,6 +891,7 @@ class Store:
         for key in ("name", "source_identity", "commit", "content_sha256", "status"):
             if not isinstance(record.get(key), str) or not record[key]:
                 raise ValueError(f"record requires a non-empty string {key!r}")
+        validate_hash_version(record)
         record_bytes = canonical_bytes(record)
         row = self._conn.execute(
             "SELECT seq, entry_hash FROM log ORDER BY seq DESC LIMIT 1"
@@ -1179,11 +1181,13 @@ class Store:
         source_identity: str = "",
         commit: str = "",
         content_sha256: str = "",
+        hash_version: int | None = None,
     ) -> list[dict[str, Any]]:
         records, _ = self.records_page(
             source_identity=source_identity,
             commit=commit,
             content_sha256=content_sha256,
+            hash_version=hash_version,
             limit=10_000,
             offset=0,
         )
@@ -1195,11 +1199,14 @@ class Store:
         source_identity: str = "",
         commit: str = "",
         content_sha256: str = "",
+        hash_version: int | None = None,
         limit: int,
         offset: int,
         max_seq: int | None = None,
         boundary: SnapshotBoundary | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
+        if hash_version is not None and (type(hash_version) is not int or hash_version not in (1, 2) or not content_sha256):
+            raise ValueError("hash_version requires content_sha256 and must be 1 or 2")
         if bool(source_identity) != bool(commit):
             raise ValueError("source_identity and commit must appear together")
         if not ((source_identity and commit) or content_sha256):
@@ -1214,16 +1221,19 @@ class Store:
             if content_sha256:
                 clauses.append("content_sha256 = ?")
                 params.append(content_sha256)
+                clauses.append("COALESCE(json_extract(record_json, '$.hash_version'), 1) = ?")
+                params.append(hash_version if hash_version is not None else 1)
             query = (
                 "SELECT record_json FROM ("
                 "SELECT record_json, name, source_identity, commit_hash, content_sha256, seq, "
+                "COALESCE(json_extract(record_json, '$.hash_version'), 1) AS hash_version, "
                 "ROW_NUMBER() OVER ("
-                "PARTITION BY name, source_identity, commit_hash, content_sha256 "
+                "PARTITION BY name, source_identity, commit_hash, COALESCE(json_extract(record_json, '$.hash_version'), 1), content_sha256 "
                 "ORDER BY seq DESC"
                 ") AS rank FROM log WHERE "
                 + " AND ".join(clauses)
                 + ") WHERE rank = 1 "
-                "ORDER BY name, source_identity, commit_hash, content_sha256 "
+                "ORDER BY name, source_identity, commit_hash, hash_version, content_sha256 "
                 "LIMIT ? OFFSET ?"
             )
             rows = self._conn.execute(query, [*params, limit + 1, offset]).fetchall()

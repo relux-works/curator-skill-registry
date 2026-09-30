@@ -91,7 +91,7 @@ def export_bundle(store: Store, signing_key: SigningKey) -> dict[str, Any]:
     records = [entry.record for entry in entries]
     snapshot = build_snapshot(store, signing_key)
     return {
-        "schema_version": 1,
+        "schema_version": 2 if any(record.get("hash_version") == 2 for record in records) else 1,
         "records": records,
         "snapshot": snapshot,
         "public_key": signing_key.public_pinned,
@@ -129,8 +129,10 @@ def import_bundle(
     """
     if not isinstance(bundle, dict) or set(bundle) - {"schema_version", "records", "snapshot", "public_key"}:
         raise ValueError("bundle contains unsupported fields")
-    if bundle.get("schema_version") != 1:
-        raise ValueError("bundle schema_version must be 1")
+    if type(bundle.get("schema_version")) is not int or bundle["schema_version"] not in (1, 2):
+        raise ValueError("bundle schema_version must be 1 or 2")
+    if bundle["schema_version"] == 2 and "public_key" not in bundle:
+        raise ValueError("bundle schema 2 requires public_key")
     snapshot = validate_snapshot(bundle.get("snapshot"))
     if not verify_signed(upstream_public_key, snapshot):
         raise ValueError("bundle snapshot does not verify against the upstream key")
@@ -146,6 +148,8 @@ def import_bundle(
     previous = "0" * 64
     for record in records:
         checked = validate_record(record)
+        if bundle["schema_version"] == 1 and checked.get("hash_version") == 2:
+            raise ValueError("hash_version_mismatch: bundle schema 1 cannot contain v2 records")
         if not verify_signed(upstream_public_key, checked):
             raise ValueError(f"bundle record for {record.get('name')!r} does not verify against the upstream key")
         entry_hash = hashlib.sha256(previous.encode("ascii") + canonical_bytes(checked)).hexdigest()

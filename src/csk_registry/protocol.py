@@ -160,11 +160,22 @@ def _canonicalize_validated(value: Any) -> None:
         ) from exc
 
 
+def validate_hash_version(record: dict[str, Any]) -> None:
+    schema = record.get("schema_version", 1)
+    if type(schema) is not int or schema not in (1, 2):
+        raise ProtocolError("audit record schema_version must be 1 or 2")
+    if (schema == 1 and "hash_version" in record) or (
+        schema == 2 and (type(record.get("hash_version")) is not int or record["hash_version"] != 2)
+    ):
+        raise ProtocolError("hash_version_mismatch: framing version disagrees with audit record schema")
+
+
 def validate_record(record: Any) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise ProtocolError("audit record must be an object")
     allowed = {
         "schema_version",
+        "hash_version",
         "name",
         "source_identity",
         "commit",
@@ -176,8 +187,7 @@ def validate_record(record: Any) -> dict[str, Any]:
     }
     if set(record) - allowed:
         raise ProtocolError("audit record contains unknown fields")
-    if record.get("schema_version", 1) != 1:
-        raise ProtocolError("audit record schema_version must be 1")
+    validate_hash_version(record)
     name = record.get("name")
     if not isinstance(name, str) or len(name) > 128 or _IDENTIFIER.fullmatch(name) is None or not _portable_component(name):
         raise ProtocolError("audit record name must be a portable identifier")
